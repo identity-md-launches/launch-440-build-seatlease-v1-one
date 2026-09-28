@@ -1,0 +1,48 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+test = "test"
+script = "script"
+solc = "0.8.26"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 200
+bytecode_hash = "none"
+cbor_metadata = false
+ffi = false
+fs_permissions = []
+gas_reports = ["SeatLease"]
+
+# The forge linter runs after every build. The excluded lints are stylistic hints that flag intentional
+# choices in SeatLease (see REVIEW.md "Linter notes"): events are emitted before the interaction they
+# describe, expiries compare against block.timestamp by design, sweep pushes ETH to the seat's own owner and
+# operator, claim() reverts inside the token loop on purpose, and the mock NFT uses _mint so tests can mint
+# to any address.
+[lint]
+lint_on_build = true
+exclude_lints = [
+    "reentrancy-events",
+    "reentrancy-no-eth",
+    "block-timestamp",
+    "arbitrary-send-eth",
+    "require-revert-in-loop",
+    "calls-loop",
+    "missing-events-access-control",
+    "missing-zero-check",
+    "unsafe-oz-erc721-mint",
+]
+
+[fuzz]
+runs = 256
+
+[invariant]
+runs = 64
+depth = 32
+fail_on_revert = true
+
+[fmt]
+line_length = 120
+tab_width = 4
+bracket_spacing = false
+int_types = "long"
