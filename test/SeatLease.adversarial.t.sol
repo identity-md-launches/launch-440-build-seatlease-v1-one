@@ -8,7 +8,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import {TunableToken, ReentrantDistributor} from "./utils/Actors.sol";
+import {TunableToken, ReentrantDistributor, Burner} from "./utils/Actors.sol";
 
 /// @dev Distributor that pays the caller in the bond token, to check that a bond-token reward is booked
 ///      separately from the bond that is held for the operator.
@@ -21,6 +21,56 @@ contract BondPayingDistributor {
 
     function claim(uint256 amount) external {
         token.transfer(msg.sender, amount);
+    }
+}
+
+/// @dev Claim target with no declared functions whose fallback answers every call with one word, so the
+///      registry's `balanceOf` probe sees a token-shaped contract. The fallback writes no state: the probe is a
+///      static call, and a fallback that wrote state would revert under it and not look like a token (nor could
+///      such a token ever be booked, since the registry reads balances statically too).
+contract WordFallback {
+    fallback(bytes calldata) external returns (bytes memory) {
+        return abi.encode(uint256(0));
+    }
+}
+
+/// @dev Claim target whose fallback answers with fewer bytes than a word: not a balance, so a valid target.
+contract ShortFallback {
+    uint256 public calls;
+
+    fallback(bytes calldata) external returns (bytes memory) {
+        calls++;
+        return hex"deadbeef";
+    }
+}
+
+/// @dev Claim target whose fallback reverts on the `balanceOf` probe and succeeds on `claim()`.
+contract RevertingFallback {
+    uint256 public calls;
+
+    fallback(bytes calldata data) external returns (bytes memory) {
+        if (bytes4(data[:4]) != bytes4(keccak256("claim()"))) revert("not a token");
+        calls++;
+        return "";
+    }
+}
+
+/// @dev Claim target that can be switched between a plain distributor and one that answers `balanceOf`.
+contract SwitchableTarget {
+    bool public answers;
+    uint256 public calls;
+
+    function setAnswers(bool value) external {
+        answers = value;
+    }
+
+    function balanceOf(address) external view returns (uint256) {
+        require(answers, "not a token");
+        return 0;
+    }
+
+    function claim() external {
+        calls++;
     }
 }
 
@@ -170,30 +220,54 @@ contract SeatLeaseAdversarialTest is Base {
 
     function test_credit_cannotMoveTheDepositedSeatThroughTheErc20Path() public {
         // `IERC20.transferFrom` and `IERC721.transferFrom` share a selector, so `credit` with the seat NFT
-        // as token reaches the NFT. It must never be able to move the seat the registry already holds.
+        // as token would reach the NFT. The revision refuses the seat NFT before any call is made, for every
+        // caller, so the seat the registry already holds can never be moved through this path.
         _depositOpen(5000);
         vm.prank(owner);
-        vm.expectRevert();
+        vm.expectRevert(abi.encodeWithSelector(SeatLease.ForbiddenToken.selector, address(nft)));
         lease.credit(TOKEN_ID, address(nft), TOKEN_ID);
         vm.prank(stranger);
-        vm.expectRevert();
+        vm.expectRevert(abi.encodeWithSelector(SeatLease.ForbiddenToken.selector, address(nft)));
         lease.credit(TOKEN_ID, address(nft), TOKEN_ID);
         assertEq(nft.ownerOf(TOKEN_ID), address(lease));
         assertEq(lease.credited(TOKEN_ID, address(nft)), 0);
     }
 
-    function test_credit_bookingTheSeatNftNeverUnlocksItAsClaimTarget() public {
-        // Even after the NFT collection has a booked entry the target guard still refuses it.
+    function test_credit_seatNftIsRefusedEvenWhenTheCallerOwnsAndApprovedAnotherSeat() public {
+        // The refusal is by address, not by outcome: a caller who really could hand a second seat over through
+        // the ERC-20 path is still refused, the second seat stays with them, nothing is booked and the NFT
+        // collection remains a forbidden claim target (with or without a booked entry).
         _depositOpen(5000);
         nft.mint(stranger, 8);
         vm.startPrank(stranger);
         nft.approve(address(lease), 8);
+        vm.expectRevert(abi.encodeWithSelector(SeatLease.ForbiddenToken.selector, address(nft)));
         lease.credit(TOKEN_ID, address(nft), 8);
         vm.stopPrank();
+        assertEq(nft.ownerOf(8), stranger);
+        assertEq(nft.getApproved(8), address(lease));
+        assertEq(lease.credited(TOKEN_ID, address(nft)), 0);
+        assertEq(lease.totalCredited(address(nft)), 0);
         vm.prank(owner);
         vm.expectRevert(abi.encodeWithSelector(SeatLease.ForbiddenTarget.selector, address(nft)));
         lease.claim(TOKEN_ID, address(nft), "", new address[](0));
         assertEq(nft.ownerOf(TOKEN_ID), address(lease));
+    }
+
+    function test_credit_seatNftRefusalPrecedesTheValueChecks() public {
+        // The NFT check runs after the deposit and zero-amount checks and before any value check, so the
+        // error for the NFT is the same whether or not ETH is attached; an undeposited seat still fails first.
+        _depositOpen(5000);
+        vm.deal(stranger, 1);
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(SeatLease.ForbiddenToken.selector, address(nft)));
+        lease.credit{value: 1}(TOKEN_ID, address(nft), 1);
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(SeatLease.ZeroAmount.selector));
+        lease.credit(TOKEN_ID, address(nft), 0);
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(SeatLease.SeatNotDeposited.selector, 8));
+        lease.credit(8, address(nft), 8);
     }
 
     function test_credit_toOneSeatDoesNotTouchAnother() public {
@@ -237,14 +311,73 @@ contract SeatLeaseAdversarialTest is Base {
         lease.claim(TOKEN_ID, address(distributor), abi.encodeCall(MockDistributor.claim, ()), tokens);
     }
 
-    function test_claim_targetWithoutCodeBooksNothing() public {
+    function test_claim_refusesEveryTargetWithoutCode() public {
+        // An EOA, a precompile (which has no code even though it answers calls), the zero address and an
+        // address whose contract has not been deployed yet are all refused before the call is made. A
+        // vacuous claim against such an address could otherwise be used as a free `claim` that books
+        // pre-existing dust.
         _depositOpen(5000);
+        reward.mint(address(lease), 7); // unbooked dust the vacuous claim must not book
         address[] memory tokens = new address[](1);
         tokens[0] = address(reward);
-        vm.prank(owner);
-        lease.claim(TOKEN_ID, stranger, hex"", tokens);
+        address[4] memory targets = [stranger, address(4), address(0), vm.computeCreateAddress(stranger, 99)];
+        for (uint256 i; i < targets.length; ++i) {
+            vm.prank(owner);
+            vm.expectRevert(abi.encodeWithSelector(SeatLease.ForbiddenTarget.selector, targets[i]));
+            lease.claim(TOKEN_ID, targets[i], hex"", tokens);
+        }
         assertEq(lease.credited(TOKEN_ID, address(reward)), 0);
         assertEq(lease.credited(TOKEN_ID, address(0)), 0);
+    }
+
+    function test_claim_refusesTargetWhoseFallbackAnswersWithAWord() public {
+        // The token guard is "answers balanceOf(this) with at least one word". A contract with a catch-all
+        // fallback that returns a word looks like a token to the registry and is refused, even though it never
+        // declared `balanceOf`, so no `approve` could ever be routed through it.
+        _depositOpen(5000);
+        WordFallback target = new WordFallback();
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(SeatLease.ForbiddenTarget.selector, address(target)));
+        lease.claim(TOKEN_ID, address(target), abi.encodeWithSignature("claim()"), new address[](0));
+    }
+
+    function test_claim_allowsTargetWhoseFallbackAnswersShortOrReverts() public {
+        // Boundary of the guard: an answer shorter than a word is not a balance, and a revert is not an answer.
+        // Such a target is a valid distributor; the call goes through and nothing is booked because nothing
+        // arrived.
+        _depositOpen(5000);
+        ShortFallback shortTarget = new ShortFallback();
+        vm.prank(owner);
+        vm.expectEmit(address(lease));
+        emit SeatLease.Claimed(TOKEN_ID, address(shortTarget), abi.encodeWithSignature("claim()"));
+        lease.claim(TOKEN_ID, address(shortTarget), abi.encodeWithSignature("claim()"), new address[](0));
+        assertEq(shortTarget.calls(), 1);
+
+        RevertingFallback revertingTarget = new RevertingFallback();
+        vm.prank(owner);
+        vm.expectEmit(address(lease));
+        emit SeatLease.Claimed(TOKEN_ID, address(revertingTarget), abi.encodeWithSignature("claim()"));
+        lease.claim(TOKEN_ID, address(revertingTarget), abi.encodeWithSignature("claim()"), new address[](0));
+        assertEq(revertingTarget.calls(), 1);
+        assertEq(lease.credited(TOKEN_ID, address(reward)), 0);
+        assertEq(lease.credited(TOKEN_ID, address(0)), 0);
+    }
+
+    function test_claim_targetGuardIsEvaluatedFreshOnEveryCall() public {
+        // A target that was a valid distributor and later starts answering `balanceOf` is refused from then on:
+        // the guard is a live probe, not a cached allow-list.
+        _depositOpen(5000);
+        SwitchableTarget target = new SwitchableTarget();
+        vm.prank(owner);
+        lease.claim(TOKEN_ID, address(target), abi.encodeCall(SwitchableTarget.claim, ()), new address[](0));
+        target.setAnswers(true);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(SeatLease.ForbiddenTarget.selector, address(target)));
+        lease.claim(TOKEN_ID, address(target), abi.encodeCall(SwitchableTarget.claim, ()), new address[](0));
+        target.setAnswers(false);
+        vm.prank(owner);
+        lease.claim(TOKEN_ID, address(target), abi.encodeCall(SwitchableTarget.claim, ()), new address[](0));
+        assertEq(target.calls(), 2);
     }
 
     function test_claim_bondTokenRewardIsBookedApartFromHeldBond() public {
@@ -267,13 +400,64 @@ contract SeatLeaseAdversarialTest is Base {
         assertEq(bond.balanceOf(address(lease)), 0);
     }
 
-    function test_claim_listingTheNftCollectionBooksNothing() public {
+    function test_claim_listingTheNftCollectionRevertsBeforeTheTargetIsCalled() public {
+        // The NFT collection is refused in the pre-call loop wherever it appears in `tokens`, so the distributor
+        // is never reached and its reward stays where it was.
         _depositOpen(5000);
-        address[] memory tokens = new address[](1);
-        tokens[0] = address(nft);
+        distributor.setReward(address(lease), 1_000, 1);
+        uint256 distributorReward = reward.balanceOf(address(distributor));
+        for (uint256 pos; pos < 3; ++pos) {
+            address[] memory tokens = new address[](3);
+            tokens[0] = address(reward);
+            tokens[1] = address(0);
+            tokens[2] = address(reward);
+            tokens[pos] = address(nft);
+            vm.prank(owner);
+            vm.expectRevert(abi.encodeWithSelector(SeatLease.ForbiddenToken.selector, address(nft)));
+            lease.claim(TOKEN_ID, address(distributor), abi.encodeCall(MockDistributor.claim, ()), tokens);
+        }
+        assertEq(reward.balanceOf(address(distributor)), distributorReward);
+        assertEq(lease.credited(TOKEN_ID, address(nft)), 0);
+        assertEq(lease.credited(TOKEN_ID, address(reward)), 0);
+        assertEq(lease.credited(TOKEN_ID, address(0)), 0);
+    }
+
+    function testFuzz_claim_repeatedListingsBookTheGainOnce(uint8 repeats, uint96 tokenAmount, uint96 ethAmount)
+        public
+    {
+        // However many times the reward token and ETH are listed, and in whatever interleaving, exactly the
+        // gain is booked and the registry stays solvent for the token.
+        repeats = uint8(bound(repeats, 1, 12));
+        tokenAmount = uint96(bound(tokenAmount, 0, 10_000e18));
+        ethAmount = uint96(bound(ethAmount, 0, 10 ether));
+        _depositOpen(5000);
+        distributor.setReward(address(lease), tokenAmount, ethAmount);
+        address[] memory tokens = new address[](2 * uint256(repeats));
+        for (uint256 i; i < tokens.length; ++i) {
+            tokens[i] = i % 2 == 0 ? address(reward) : address(0);
+        }
         vm.prank(owner);
         lease.claim(TOKEN_ID, address(distributor), abi.encodeCall(MockDistributor.claim, ()), tokens);
-        assertEq(lease.credited(TOKEN_ID, address(nft)), 0);
+        assertEq(lease.credited(TOKEN_ID, address(reward)), tokenAmount);
+        assertEq(lease.credited(TOKEN_ID, address(0)), ethAmount);
+        assertEq(lease.totalCredited(address(reward)), reward.balanceOf(address(lease)));
+        assertEq(lease.totalCredited(address(0)), address(lease).balance);
+    }
+
+    function test_claim_duplicateListingsDoNotHideADecrease() public {
+        // The skip for a repeated entry applies only to booking. A listed balance that fell during the call is
+        // still caught on its first entry, even when that entry is repeated later in the list.
+        _depositOpen(5000);
+        TunableToken t = new TunableToken();
+        t.mint(address(lease), 5);
+        Burner burner = new Burner();
+        address[] memory tokens = new address[](3);
+        tokens[0] = address(t);
+        tokens[1] = address(reward);
+        tokens[2] = address(t);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(SeatLease.BookedBalanceDecreased.selector, address(t), 5, 0));
+        lease.claim(TOKEN_ID, address(burner), abi.encodeCall(Burner.burn, (t, 5)), tokens);
     }
 
     function test_claim_ownerOfAnotherSeatCannotClaimForThisOne() public {
@@ -662,6 +846,42 @@ contract SeatLeaseAdversarialTest is Base {
         t.expiresAt = expiry + 1 days;
         assertEq(lease.isValidSignature(digest, _encode1271(t, sig)), FAIL);
         assertEq(lease.isValidSignature(_workerDigest(t), _encode1271(t, sig)), FAIL);
+    }
+
+    function test_isValidSignature_rejectsDirtyHighBitsInStaticWords() public {
+        // A blob whose decoded values equal a valid authorization but whose static words carry bits outside the
+        // declared type (padding of the address, of the uint64 expiry) is not the canonical encoding and must
+        // fail rather than be accepted as the same authorization. Flipping a bit inside the value range fails
+        // too, as the digest no longer matches.
+        _depositOpen(5000);
+        _takeOpen();
+        (bytes32 digest, bytes memory blob) = _signedBlob(operatorKey, TOKEN_ID, uint64(block.timestamp + 1 days));
+        assertEq(lease.isValidSignature(digest, blob), MAGIC);
+
+        // Word 1 is the wallet: byte 32 is its highest padding byte.
+        bytes memory dirtyWallet = _copy(blob);
+        dirtyWallet[32] = 0x01;
+        assertEq(lease.isValidSignature(digest, dirtyWallet), FAIL);
+
+        // Word 4 is expiresAt: byte 128 is its highest padding byte.
+        bytes memory dirtyExpiry = _copy(blob);
+        dirtyExpiry[4 * 32] = 0x01;
+        assertEq(lease.isValidSignature(digest, dirtyExpiry), FAIL);
+
+        // Word 2 is the tokenId: flip its lowest byte, which is a valid but different tokenId.
+        bytes memory otherSeat = _copy(blob);
+        otherSeat[3 * 32 - 1] ^= 0x01;
+        assertEq(lease.isValidSignature(digest, otherSeat), FAIL);
+
+        // Every mutated blob is refused by the decoder or the digest check; the untouched blob still pairs.
+        assertEq(lease.isValidSignature(digest, blob), MAGIC);
+    }
+
+    function _copy(bytes memory data) internal pure returns (bytes memory out) {
+        out = new bytes(data.length);
+        for (uint256 i; i < data.length; ++i) {
+            out[i] = data[i];
+        }
     }
 
     function test_isValidSignature_rejectsCompactAndZeroSignatures() public {
