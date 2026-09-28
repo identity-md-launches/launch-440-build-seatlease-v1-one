@@ -193,11 +193,13 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
     error WrongValue(uint256 expected, uint256 actual);
     error ZeroAmount();
     error ForbiddenTarget(address target);
+    error ForbiddenToken(address token);
     error ClaimFailed(bytes reason);
     error BookedBalanceDecreased(address token, uint256 before, uint256 afterwards);
     error EthTransferFailed(address to, uint256 amount);
     error NothingOwed(address account);
     error DirectEthNotAccepted();
+    error MalformedAuthorization();
 
     // ---------------------------------------------------------------------------------------------
     // Constructor
@@ -230,6 +232,9 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
     // ---------------------------------------------------------------------------------------------
 
     /// @notice Deposit a seat you own and record its lease terms.
+    /// @dev The oracle attestation carries no tokenId, so an attestation for `questionHash` is valid for every seat
+    ///      that shares that hash and `oracleSigner`. Give each seat its own question (for example, include the
+    ///      tokenId in the question text the oracle answers) so an attestation can only cut the seat it was issued for.
     function deposit(
         uint256 tokenId,
         uint16 ownerBps,
@@ -355,9 +360,12 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
     // ---------------------------------------------------------------------------------------------
 
     /// @notice Book `amount` of `token` (address(0) = ETH sent as msg.value) to a seat. Anyone may pay.
+    /// @dev The seat NFT is refused as `token`: its `transferFrom` shares the ERC-20 selector and would pull a seat
+    ///      into the registry that could never be swept out again.
     function credit(uint256 tokenId, address token, uint256 amount) external payable nonReentrant {
         if (_seats[tokenId].owner == address(0)) revert SeatNotDeposited(tokenId);
         if (amount == 0) revert ZeroAmount();
+        if (token == address(seatNFT)) revert ForbiddenToken(token);
         uint256 received;
         if (token == address(0)) {
             if (msg.value != amount) revert WrongValue(amount, msg.value);
@@ -374,10 +382,14 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
     }
 
     /// @notice Call a reward distributor on behalf of a seat you deposited and book what arrives in `tokens`.
-    /// @dev `target` may not be the seat NFT, the bond token, this contract, or any token that has booked
-    ///      balances. The call carries no value. Afterwards this contract must still hold the seat and the balance
-    ///      of every listed token must not have decreased. ETH is always measured, whether or not `address(0)` is
-    ///      listed, because `receive` only opens during this call and nothing that arrives may stay unattributed.
+    /// @dev `target` may not be the seat NFT, the bond token, this contract, an address without code, a token that
+    ///      has booked balances, or any contract that answers `balanceOf(address(this))`: the registry is
+    ///      `msg.sender` of the call, so it must never call a token it could ever hold (an `approve` would outlive
+    ///      the call and drain balances booked to other seats later). `tokens` may not name the seat NFT; a token
+    ///      listed more than once is measured and booked once. The call carries no value. Afterwards this contract
+    ///      must still hold the seat and the balance of every listed token must not have decreased. ETH is always
+    ///      measured, whether or not `address(0)` is listed, because `receive` only opens during this call and
+    ///      nothing that arrives may stay unattributed.
     function claim(uint256 tokenId, address target, bytes calldata data, address[] calldata tokens)
         external
         nonReentrant
@@ -385,12 +397,13 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
         _onlyOwner(tokenId);
         if (
             target == address(seatNFT) || target == address(bondToken) || target == address(this)
-                || totalCredited[target] != 0
+                || target.code.length == 0 || totalCredited[target] != 0 || _answersBalanceOf(target)
         ) revert ForbiddenTarget(target);
 
         uint256 ethBefore = address(this).balance;
         uint256[] memory before = new uint256[](tokens.length);
         for (uint256 i; i < tokens.length; ++i) {
+            if (tokens[i] == address(seatNFT)) revert ForbiddenToken(tokens[i]);
             before[i] = _balanceOf(tokens[i]);
         }
 
@@ -402,7 +415,7 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
 
         if (seatNFT.ownerOf(tokenId) != address(this)) revert NftNotHeld(tokenId);
         for (uint256 i; i < tokens.length; ++i) {
-            if (tokens[i] == address(0)) continue;
+            if (tokens[i] == address(0) || _listedBefore(tokens, i)) continue;
             uint256 afterwards = _balanceOf(tokens[i]);
             if (afterwards < before[i]) revert BookedBalanceDecreased(tokens[i], before[i], afterwards);
             uint256 gained = afterwards - before[i];
@@ -472,7 +485,9 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
     }
 
     /// @notice Split an ERC-1271 signature blob into its authorization and the operator's signature.
-    /// @dev External so `isValidSignature` can catch decoding failures instead of reverting.
+    /// @dev External so `isValidSignature` can catch decoding failures instead of reverting. Only the canonical
+    ///      `abi.encode` of the fields is accepted: a blob with trailing or otherwise non-canonical bytes reverts,
+    ///      so every accepted authorization has exactly one byte encoding.
     function decodeAuthorization(bytes calldata signature)
         external
         pure
@@ -481,6 +496,10 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
         (
             auth.deviceKey, auth.wallet, auth.tokenId, auth.nonce, auth.expiresAt, auth.relayOrigin, operatorSignature
         ) = abi.decode(signature, (bytes32, address, uint256, bytes32, uint64, string, bytes));
+        bytes memory canonical = abi.encode(
+            auth.deviceKey, auth.wallet, auth.tokenId, auth.nonce, auth.expiresAt, auth.relayOrigin, operatorSignature
+        );
+        if (keccak256(canonical) != keccak256(signature)) revert MalformedAuthorization();
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -620,6 +639,21 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
 
     function _balanceOf(address token) private view returns (uint256) {
         return token == address(0) ? address(this).balance : IERC20(token).balanceOf(address(this));
+    }
+
+    /// @dev True when `tokens[i]` already appears at a lower index, so a repeated entry is booked only once.
+    function _listedBefore(address[] calldata tokens, uint256 i) private pure returns (bool) {
+        for (uint256 j; j < i; ++j) {
+            if (tokens[j] == tokens[i]) return true;
+        }
+        return false;
+    }
+
+    /// @dev True when `target` answers `balanceOf(address(this))` with a word, i.e. it is a token whose balance the
+    ///      registry could book. Such a contract is never a valid `claim` target.
+    function _answersBalanceOf(address target) private view returns (bool) {
+        (bool ok, bytes memory ret) = target.staticcall(abi.encodeCall(IERC20.balanceOf, (address(this))));
+        return ok && ret.length >= 32;
     }
 
     /// @dev Pushes a bond. If the bond token refuses the transfer (for example a blocklisted recipient) the

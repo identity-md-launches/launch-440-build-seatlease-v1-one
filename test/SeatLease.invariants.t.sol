@@ -152,8 +152,11 @@ contract Handler is Test {
         reward.mint(address(distributor), amount);
         vm.deal(address(distributor), address(distributor).balance + ethAmount);
         distributor.setReward(address(lease), amount, ethAmount);
-        address[] memory tokens = new address[](1);
+        // The reward token is listed twice and ETH once: a repeated entry must be booked only once.
+        address[] memory tokens = new address[](3);
         tokens[0] = address(reward);
+        tokens[1] = address(0);
+        tokens[2] = address(reward);
         vm.prank(s.owner);
         lease.claim(t, address(distributor), abi.encodeCall(MockDistributor.claim, ()), tokens);
         ghostCredited += amount;

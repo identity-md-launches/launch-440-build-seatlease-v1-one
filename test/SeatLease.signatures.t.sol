@@ -173,6 +173,57 @@ contract SeatLeaseSignaturesTest is Base {
         assertEq(lease.isValidSignature(digest, _encode1271(a, abi.encodePacked(r, s, uint8(29)))), FAIL);
     }
 
+    /// @dev Regression for finding 2bdc3488: only the canonical `abi.encode` of the blob is accepted.
+    function test_isValidSignature_rejectsTrailingAndNonCanonicalBytes() public {
+        (bytes32 digest, bytes memory blob) = _validBlob();
+        assertEq(lease.isValidSignature(digest, blob), MAGIC);
+        assertEq(lease.isValidSignature(digest, bytes.concat(blob, hex"deadbeef")), FAIL);
+        assertEq(lease.isValidSignature(digest, bytes.concat(blob, new bytes(32))), FAIL);
+
+        // Same fields and same decoded values, but the dynamic tails sit one word further than canonical.
+        SeatLease.WorkerAuthorization memory a = _auth(TOKEN_ID, expiry);
+        bytes memory sig = _sign(operatorKey, digest);
+        bytes memory origin = _padded(bytes(a.relayOrigin));
+        bytes memory shifted = abi.encodePacked(
+            a.deviceKey,
+            uint256(uint160(a.wallet)),
+            a.tokenId,
+            a.nonce,
+            uint256(a.expiresAt),
+            uint256(32 * 8),
+            uint256(32 * 8 + origin.length),
+            uint256(0), // padding word the offsets skip over
+            origin,
+            _padded(sig)
+        );
+        (SeatLease.WorkerAuthorization memory back, bytes memory sigBack) = _rawDecode(shifted);
+        assertEq(back.tokenId, a.tokenId);
+        assertEq(sigBack, sig);
+        assertEq(lease.isValidSignature(digest, shifted), FAIL);
+
+        vm.expectRevert(SeatLease.MalformedAuthorization.selector);
+        lease.decodeAuthorization(bytes.concat(blob, hex"00"));
+        vm.expectRevert(SeatLease.MalformedAuthorization.selector);
+        lease.decodeAuthorization(shifted);
+    }
+
+    /// @dev Length word plus data padded to a multiple of 32 bytes, as in an ABI tail.
+    function _padded(bytes memory data) internal pure returns (bytes memory) {
+        bytes memory out = bytes.concat(bytes32(data.length), data);
+        uint256 pad = (32 - (data.length % 32)) % 32;
+        return bytes.concat(out, new bytes(pad));
+    }
+
+    /// @dev Plain `abi.decode`, to show the shifted blob decodes to the same values the registry refuses.
+    function _rawDecode(bytes memory blob)
+        internal
+        pure
+        returns (SeatLease.WorkerAuthorization memory auth, bytes memory sig)
+    {
+        (auth.deviceKey, auth.wallet, auth.tokenId, auth.nonce, auth.expiresAt, auth.relayOrigin, sig) =
+            abi.decode(blob, (bytes32, address, uint256, bytes32, uint64, string, bytes));
+    }
+
     function test_decodeAuthorization_roundTrips() public view {
         SeatLease.WorkerAuthorization memory a = _auth(TOKEN_ID, expiry);
         bytes memory sig = hex"aabbcc";

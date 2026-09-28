@@ -16,7 +16,9 @@ import {
     ReentrantDistributor,
     Thief,
     EthPayer,
-    EvilNFT
+    EvilNFT,
+    Burner,
+    BalanceOfAnswerer
 } from "./utils/Actors.sol";
 
 /// @dev credit / claim / sweep: booking, split math, guards and reentrancy.
@@ -427,12 +429,133 @@ contract SeatLeaseRewardsTest is Base {
         _depositOpen(5000);
         TunableToken t = new TunableToken();
         t.mint(address(lease), 5); // unbooked dust held by the registry
+        Burner burner = new Burner();
         address[] memory tokens = new address[](1);
         tokens[0] = address(t);
-        bytes memory burn = abi.encodeCall(TunableToken.burnFrom, (address(lease), 5));
+        bytes memory burn = abi.encodeCall(Burner.burn, (t, 5));
         vm.prank(owner);
         vm.expectRevert(abi.encodeWithSelector(SeatLease.BookedBalanceDecreased.selector, address(t), 5, 0));
-        lease.claim(TOKEN_ID, address(t), burn, tokens);
+        lease.claim(TOKEN_ID, address(burner), burn, tokens);
+    }
+
+    // ---------------------------------------------------------- claim: revision regressions
+
+    /// @dev Regression for finding 6488b67c: a token listed more than once is booked once, so a duplicate list
+    ///      cannot book more than arrived and drain rewards booked to another seat.
+    function test_claim_duplicateTokenEntriesBookOnce() public {
+        _depositOpen(5000);
+        _depositSecondSeat();
+        _creditSecondSeat();
+        distributor.setReward(address(lease), AMOUNT, 0);
+        address[] memory tokens = new address[](11);
+        for (uint256 i; i < tokens.length; ++i) {
+            tokens[i] = address(reward);
+        }
+        vm.prank(owner);
+        vm.expectEmit(address(lease));
+        emit SeatLease.Booked(TOKEN_ID, address(reward), AMOUNT);
+        lease.claim(TOKEN_ID, address(distributor), abi.encodeCall(MockDistributor.claim, ()), tokens);
+        assertEq(lease.credited(TOKEN_ID, address(reward)), AMOUNT);
+        assertEq(lease.totalCredited(address(reward)), 2 * AMOUNT);
+        assertGe(reward.balanceOf(address(lease)), lease.totalCredited(address(reward)));
+
+        lease.sweep(TOKEN_ID, address(reward));
+        assertEq(reward.balanceOf(owner), 11 * AMOUNT);
+        lease.sweep(8, address(reward));
+        assertEq(reward.balanceOf(stranger), 10 * AMOUNT);
+    }
+
+    function test_claim_duplicateEthAndTokenEntriesBookOnce() public {
+        _depositOpen(5000);
+        distributor.setReward(address(lease), AMOUNT, 1 ether);
+        address[] memory tokens = new address[](4);
+        tokens[0] = address(0);
+        tokens[1] = address(reward);
+        tokens[2] = address(0);
+        tokens[3] = address(reward);
+        vm.prank(owner);
+        lease.claim(TOKEN_ID, address(distributor), abi.encodeCall(MockDistributor.claim, ()), tokens);
+        assertEq(lease.credited(TOKEN_ID, address(0)), 1 ether);
+        assertEq(lease.credited(TOKEN_ID, address(reward)), AMOUNT);
+    }
+
+    /// @dev Regression for finding e2a5a011: a token is never a valid target, even while nothing is booked in it,
+    ///      so the registry can never `approve` a spender that drains later credits.
+    function test_claim_forbidsTokenTargetEvenWhenNothingBooked() public {
+        _depositOpen(5000);
+        _depositSecondSeat();
+        assertEq(lease.totalCredited(address(reward)), 0);
+        bytes memory approve = abi.encodeCall(IERC20.approve, (owner, type(uint256).max));
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(SeatLease.ForbiddenTarget.selector, address(reward)));
+        lease.claim(TOKEN_ID, address(reward), approve, new address[](0));
+        assertEq(reward.allowance(address(lease), owner), 0);
+
+        // The other seat's later credit is fully backed and sweepable.
+        _creditSecondSeat();
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientAllowance.selector, owner, 0, AMOUNT));
+        reward.transferFrom(address(lease), owner, AMOUNT);
+        lease.sweep(8, address(reward));
+        assertEq(reward.balanceOf(stranger), 10 * AMOUNT);
+
+        // Any other token-shaped contract is refused too, whether or not the registry holds any of it.
+        TunableToken t = new TunableToken();
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(SeatLease.ForbiddenTarget.selector, address(t)));
+        lease.claim(TOKEN_ID, address(t), approve, new address[](0));
+        BalanceOfAnswerer answerer = new BalanceOfAnswerer();
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(SeatLease.ForbiddenTarget.selector, address(answerer)));
+        lease.claim(TOKEN_ID, address(answerer), abi.encodeCall(BalanceOfAnswerer.claim, ()), new address[](0));
+    }
+
+    function test_claim_forbidsTargetWithoutCode() public {
+        _depositOpen(5000);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(SeatLease.ForbiddenTarget.selector, stranger));
+        lease.claim(TOKEN_ID, stranger, "", new address[](0));
+    }
+
+    function test_claim_rejectsSeatNftInTokenList() public {
+        _depositOpen(5000);
+        address[] memory tokens = new address[](2);
+        tokens[0] = address(reward);
+        tokens[1] = address(nft);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(SeatLease.ForbiddenToken.selector, address(nft)));
+        lease.claim(TOKEN_ID, address(distributor), abi.encodeCall(MockDistributor.claim, ()), tokens);
+    }
+
+    /// @dev Regression for finding 0523d79f: the seat NFT shares the ERC-20 `transferFrom` selector, so it is
+    ///      refused as a `credit` token instead of being pulled in and stuck forever.
+    function test_credit_rejectsSeatNftAsToken() public {
+        _depositOpen(5000);
+        nft.mint(stranger, 8);
+        vm.startPrank(stranger);
+        nft.approve(address(lease), 8);
+        vm.expectRevert(abi.encodeWithSelector(SeatLease.ForbiddenToken.selector, address(nft)));
+        lease.credit(TOKEN_ID, address(nft), 8);
+        vm.stopPrank();
+        assertEq(nft.ownerOf(8), stranger);
+        assertEq(lease.credited(TOKEN_ID, address(nft)), 0);
+    }
+
+    /// @dev Deposits seat 8 for `stranger`, so a second seat can be the victim of an accounting attack.
+    function _depositSecondSeat() internal {
+        nft.mint(stranger, 8);
+        vm.startPrank(stranger);
+        nft.approve(address(lease), 8);
+        lease.deposit(8, 10_000, SeatLease.Mode.Open, address(0), 0, address(0), bytes32(0), "");
+        vm.stopPrank();
+    }
+
+    /// @dev `stranger` books AMOUNT of the reward token to seat 8.
+    function _creditSecondSeat() internal {
+        vm.startPrank(stranger);
+        reward.approve(address(lease), AMOUNT);
+        lease.credit(8, address(reward), AMOUNT);
+        vm.stopPrank();
     }
 
     function test_claim_revertsWhenNftLeaves() public {

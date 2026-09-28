@@ -164,6 +164,22 @@ contract Thief {
     }
 }
 
+/// @dev Non-token claim target that burns a token balance held by its caller, to make a listed balance decrease.
+contract Burner {
+    function burn(TunableToken token, uint256 amount) external {
+        token.burnFrom(msg.sender, amount);
+    }
+}
+
+/// @dev Non-token claim target that pays a fixed reward but also answers `balanceOf`, like a token would.
+contract BalanceOfAnswerer {
+    function balanceOf(address) external pure returns (uint256) {
+        return 0;
+    }
+
+    function claim() external {}
+}
+
 /// @dev Distributor that just pays ETH.
 contract EthPayer {
     receive() external payable {}
