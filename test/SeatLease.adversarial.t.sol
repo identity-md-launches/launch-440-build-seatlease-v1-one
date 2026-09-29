@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import {Base} from "./utils/Base.sol";
 import {SeatLease} from "../src/SeatLease.sol";
+import {SeatHolder} from "../src/SeatHolder.sol";
 import {MockDistributor} from "../src/mocks/MockDistributor.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
@@ -151,6 +152,7 @@ contract SeatLeaseAdversarialTest is Base {
         lease.quit(TOKEN_ID);
         vm.prank(owner);
         lease.setTerms(TOKEN_ID, 5000, SeatLease.Mode.Open, address(0), 2 * BOND_AMOUNT, oracle, QUESTION, "");
+        _activateTerms();
         vm.startPrank(stranger);
         bond.approve(address(lease), 2 * BOND_AMOUNT);
         lease.take(TOKEN_ID);
@@ -206,14 +208,14 @@ contract SeatLeaseAdversarialTest is Base {
     }
 
     function test_nftTransferAfterDepositDoesNotChangeSeatOwner() public {
-        // The registry holds the token; the depositor keeps administering the seat even after selling
+        // The seat's holder holds the token; the depositor keeps administering the seat even after selling
         // nothing (there is nothing to sell) and a second party cannot claim it.
         _depositOpen(5000);
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(SeatLease.NotSeatOwner.selector, TOKEN_ID, stranger));
         lease.withdraw(TOKEN_ID);
         assertEq(lease.seat(TOKEN_ID).owner, owner);
-        assertEq(nft.ownerOf(TOKEN_ID), address(lease));
+        assertEq(nft.ownerOf(TOKEN_ID), _holder());
     }
 
     // ------------------------------------------------------------------ credit edges
@@ -221,7 +223,7 @@ contract SeatLeaseAdversarialTest is Base {
     function test_credit_cannotMoveTheDepositedSeatThroughTheErc20Path() public {
         // `IERC20.transferFrom` and `IERC721.transferFrom` share a selector, so `credit` with the seat NFT
         // as token would reach the NFT. The revision refuses the seat NFT before any call is made, for every
-        // caller, so the seat the registry already holds can never be moved through this path.
+        // caller, so the seat in custody can never be moved through this path.
         _depositOpen(5000);
         vm.prank(owner);
         vm.expectRevert(abi.encodeWithSelector(SeatLease.ForbiddenToken.selector, address(nft)));
@@ -229,7 +231,7 @@ contract SeatLeaseAdversarialTest is Base {
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(SeatLease.ForbiddenToken.selector, address(nft)));
         lease.credit(TOKEN_ID, address(nft), TOKEN_ID);
-        assertEq(nft.ownerOf(TOKEN_ID), address(lease));
+        assertEq(nft.ownerOf(TOKEN_ID), _holder());
         assertEq(lease.credited(TOKEN_ID, address(nft)), 0);
     }
 
@@ -251,7 +253,7 @@ contract SeatLeaseAdversarialTest is Base {
         vm.prank(owner);
         vm.expectRevert(abi.encodeWithSelector(SeatLease.ForbiddenTarget.selector, address(nft)));
         lease.claim(TOKEN_ID, address(nft), "", new address[](0));
-        assertEq(nft.ownerOf(TOKEN_ID), address(lease));
+        assertEq(nft.ownerOf(TOKEN_ID), _holder());
     }
 
     function test_credit_seatNftRefusalPrecedesTheValueChecks() public {
@@ -404,7 +406,7 @@ contract SeatLeaseAdversarialTest is Base {
         // The NFT collection is refused in the pre-call loop wherever it appears in `tokens`, so the distributor
         // is never reached and its reward stays where it was.
         _depositOpen(5000);
-        distributor.setReward(address(lease), 1_000, 1);
+        distributor.setReward(_holder(), 1_000, 1);
         uint256 distributorReward = reward.balanceOf(address(distributor));
         for (uint256 pos; pos < 3; ++pos) {
             address[] memory tokens = new address[](3);
@@ -431,7 +433,7 @@ contract SeatLeaseAdversarialTest is Base {
         tokenAmount = uint96(bound(tokenAmount, 0, 10_000e18));
         ethAmount = uint96(bound(ethAmount, 0, 10 ether));
         _depositOpen(5000);
-        distributor.setReward(address(lease), tokenAmount, ethAmount);
+        distributor.setReward(_holder(), tokenAmount, ethAmount);
         address[] memory tokens = new address[](2 * uint256(repeats));
         for (uint256 i; i < tokens.length; ++i) {
             tokens[i] = i % 2 == 0 ? address(reward) : address(0);
@@ -449,15 +451,17 @@ contract SeatLeaseAdversarialTest is Base {
         // still caught on its first entry, even when that entry is repeated later in the list.
         _depositOpen(5000);
         TunableToken t = new TunableToken();
-        t.mint(address(lease), 5);
+        t.mint(_holder(), 5);
         Burner burner = new Burner();
         address[] memory tokens = new address[](3);
         tokens[0] = address(t);
         tokens[1] = address(reward);
         tokens[2] = address(t);
         vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(SeatLease.BookedBalanceDecreased.selector, address(t), 5, 0));
+        vm.expectRevert(abi.encodeWithSelector(SeatLease.HolderBalanceDecreased.selector, address(t), 5, 0));
         lease.claim(TOKEN_ID, address(burner), abi.encodeCall(Burner.burn, (t, 5)), tokens);
+        assertEq(t.balanceOf(_holder()), 5, "failed claim must roll back the burn");
+        assertEq(lease.credited(TOKEN_ID, address(t)), 0);
     }
 
     function test_claim_ownerOfAnotherSeatCannotClaimForThisOne() public {
@@ -471,7 +475,7 @@ contract SeatLeaseAdversarialTest is Base {
     function test_claim_rewardIsBookedToTheClaimingSeatOnly() public {
         _depositOpen(5000);
         _depositSecondSeat(8, stranger, 0, operator);
-        distributor.setReward(address(lease), 1_000, 1);
+        distributor.setReward(lease.holderOf(8), 1_000, 1);
         address[] memory tokens = new address[](1);
         tokens[0] = address(reward);
         vm.prank(stranger);
@@ -484,7 +488,7 @@ contract SeatLeaseAdversarialTest is Base {
 
     function test_claim_reentryIntoTakeDepositRedeemAndOracleCutIsBlocked() public {
         _depositOpen(5000);
-        ReentrantDistributor re = new ReentrantDistributor();
+        ReentrantDistributor re = new ReentrantDistributor(address(lease));
         bytes memory expected = abi.encodeWithSelector(
             SeatLease.ClaimFailed.selector,
             abi.encodeWithSelector(ReentrancyGuard.ReentrancyGuardReentrantCall.selector)
@@ -505,10 +509,9 @@ contract SeatLeaseAdversarialTest is Base {
     }
 
     function test_claim_targetCannotSetTermsDuringClaim() public {
-        // `setTerms` has no reentrancy guard; it is safe only because the owner check binds it to the seat
-        // owner and the claim target is never that owner. This pins that reasoning.
+        // An unrelated claim target cannot change this seat's terms, even during the owner's claim.
         _depositOpen(5000);
-        ReentrantDistributor re = new ReentrantDistributor();
+        ReentrantDistributor re = new ReentrantDistributor(address(lease));
         re.setPayload(
             abi.encodeCall(
                 SeatLease.setTerms, (TOKEN_ID, 0, SeatLease.Mode.Open, address(0), 0, address(0), bytes32(0), "")
@@ -525,15 +528,15 @@ contract SeatLeaseAdversarialTest is Base {
         assertEq(lease.seat(TOKEN_ID).ownerBps, 5000);
     }
 
-    function test_claim_targetCannotPairADeviceThroughOnERC721Received() public {
+    function test_claim_targetCannotInvokeHolderReceiverHook() public {
         _depositOpen(5000);
-        ReentrantDistributor re = new ReentrantDistributor();
-        re.setPayload(abi.encodeCall(SeatLease.onERC721Received, (address(0), address(0), 8, "")));
+        ReentrantDistributor re = new ReentrantDistributor(_holder());
+        re.setPayload(abi.encodeCall(SeatHolder.onERC721Received, (address(0), address(0), 8, "")));
         vm.prank(owner);
         vm.expectRevert(
             abi.encodeWithSelector(
                 SeatLease.ClaimFailed.selector,
-                abi.encodeWithSelector(SeatLease.UnexpectedToken.selector, address(re), 8)
+                abi.encodeWithSelector(SeatHolder.UnexpectedToken.selector, address(re), 8)
             )
         );
         lease.claim(TOKEN_ID, address(re), abi.encodeCall(ReentrantDistributor.claim, ()), new address[](0));
@@ -554,14 +557,14 @@ contract SeatLeaseAdversarialTest is Base {
         address[] memory tokens = new address[](1);
         tokens[0] = address(reward);
         bytes memory data = abi.encodeCall(MockDistributor.claim, ());
-        distributor.setReward(address(lease), 100, 0);
+        distributor.setReward(_holder(), 100, 0);
         vm.prank(owner);
         lease.claim(TOKEN_ID, address(distributor), data, tokens);
         // Nothing new to pay: the second claim must not re-book the balance already held.
         vm.prank(owner);
         lease.claim(TOKEN_ID, address(distributor), data, tokens);
         assertEq(lease.credited(TOKEN_ID, address(reward)), 100);
-        distributor.setReward(address(lease), 7, 0);
+        distributor.setReward(_holder(), 7, 0);
         vm.prank(owner);
         lease.claim(TOKEN_ID, address(distributor), data, tokens);
         assertEq(lease.credited(TOKEN_ID, address(reward)), 107);
@@ -588,15 +591,21 @@ contract SeatLeaseAdversarialTest is Base {
         assertEq(reward.balanceOf(operator), 9_999);
     }
 
-    function test_sweep_afterOracleCutPaysEverythingToOwner() public {
+    function test_sweep_afterOracleCutPreservesOperatorsBookedShare() public {
         _depositOpen(0);
         _takeOpen();
         _creditReward(TOKEN_ID, stranger, 1_000);
         SeatLease.OracleAttestation memory att = _goodAttestation(keccak256("req"));
         lease.cutByOracle(TOKEN_ID, att, _signAttestation(oracleKey, att));
+        // The forfeiture is the bond; already booked rewards still belong to the cut operator.
+        _creditReward(TOKEN_ID, stranger, 7);
         lease.sweep(TOKEN_ID, address(reward));
-        assertEq(reward.balanceOf(owner), 10_000e18 + 1_000);
+        assertEq(reward.balanceOf(owner), 10_000e18 + 7);
         assertEq(reward.balanceOf(operator), 0);
+        assertEq(lease.credited(TOKEN_ID, address(reward)), 1_000);
+        lease.sweepFor(TOKEN_ID, address(reward), operator);
+        assertEq(reward.balanceOf(operator), 1_000);
+        assertEq(lease.credited(TOKEN_ID, address(reward)), 0);
     }
 
     function test_sweep_twiceRevertsSecondTime() public {
@@ -620,25 +629,33 @@ contract SeatLeaseAdversarialTest is Base {
         assertEq(reward.balanceOf(address(lease)), 0);
     }
 
-    function test_sweep_usesTermsAtSweepTimeNotAtCreditTime() public {
+    function test_sweep_preservesBookingAcrossTermChanges() public {
         _depositOpen(10_000);
         _creditReward(TOKEN_ID, stranger, 100);
         vm.prank(owner);
         lease.setTerms(TOKEN_ID, 0, SeatLease.Mode.Permissioned, operator, 0, oracle, QUESTION, "");
+        _activateTerms();
         _takePermissioned();
+        _creditReward(TOKEN_ID, stranger, 7);
         lease.sweep(TOKEN_ID, address(reward));
-        assertEq(reward.balanceOf(operator), 100);
+        assertEq(reward.balanceOf(owner), 10_000e18 + 100);
+        assertEq(reward.balanceOf(operator), 7);
+        assertEq(lease.credited(TOKEN_ID, address(reward)), 0);
     }
 
-    function test_sweep_operatorWhoQuitGetsNothingFromLaterSweep() public {
+    function test_sweep_operatorWhoQuitCanCollectItsEarlierShare() public {
         _depositOpen(0);
         _takeOpen();
         _creditReward(TOKEN_ID, stranger, 100);
         vm.prank(operator);
         lease.quit(TOKEN_ID);
+        vm.expectRevert(SeatLease.ZeroAmount.selector);
         lease.sweep(TOKEN_ID, address(reward));
         assertEq(reward.balanceOf(operator), 0);
-        assertEq(reward.balanceOf(owner), 10_000e18 + 100);
+        assertEq(reward.balanceOf(owner), 10_000e18);
+        lease.sweepFor(TOKEN_ID, address(reward), operator);
+        assertEq(reward.balanceOf(operator), 100);
+        assertEq(lease.credited(TOKEN_ID, address(reward)), 0);
     }
 
     // ------------------------------------------------------------------ cutByOracle edges
@@ -659,12 +676,14 @@ contract SeatLeaseAdversarialTest is Base {
 
     function test_cutByOracle_rotatedSignerInvalidatesOldAttestations() public {
         _depositOpen(5000);
-        SeatLease.OracleAttestation memory att = _goodAttestation(keccak256("req"));
-        bytes memory sig = _signAttestation(oracleKey, att);
         (address newOracle,) = makeAddrAndKey("new-oracle");
         vm.prank(owner);
         lease.setTerms(TOKEN_ID, 5000, SeatLease.Mode.Open, address(0), BOND_AMOUNT, newOracle, QUESTION, "");
+        _activateTerms();
         _takeOpen();
+        // Keep the attestation fresh so this exercises signer rotation rather than tenure/expiry guards.
+        SeatLease.OracleAttestation memory att = _goodAttestation(keccak256("req"));
+        bytes memory sig = _signAttestation(oracleKey, att);
         vm.expectRevert(abi.encodeWithSelector(SeatLease.OracleSignerMismatch.selector, newOracle, oracle));
         lease.cutByOracle(TOKEN_ID, att, sig);
     }
@@ -978,9 +997,9 @@ contract SeatLeaseAdversarialTest is Base {
 
     function testFuzz_cutByOracle_expiryBoundary(uint64 expiresAt, uint64 now_) public {
         now_ = uint64(bound(now_, 1, type(uint64).max - 1));
+        vm.warp(now_);
         _depositOpen(5000);
         _takeOpen();
-        vm.warp(now_);
         SeatLease.OracleAttestation memory att = _goodAttestation(keccak256("req"));
         att.expiresAt = expiresAt;
         bytes memory sig = _signAttestation(oracleKey, att);
@@ -1010,11 +1029,12 @@ contract SeatLeaseAdversarialTest is Base {
         _depositOpen(5000);
         _takeOpen();
         SeatLease.OracleAttestation memory att = _goodAttestation(keccak256("req"));
+        uint256 callerBalanceBefore = bond.balanceOf(caller);
         vm.prank(caller);
         lease.cutByOracle(TOKEN_ID, att, _signAttestation(oracleKey, att));
         assertEq(lease.seat(TOKEN_ID).operator, address(0));
         assertEq(bond.balanceOf(owner), BOND_AMOUNT);
-        assertEq(bond.balanceOf(caller), caller == operator ? 9 * BOND_AMOUNT : bond.balanceOf(caller));
+        assertEq(bond.balanceOf(caller), callerBalanceBefore + (caller == owner ? BOND_AMOUNT : 0));
     }
 
     function testFuzz_take_openBondRoundTripForAnyTaker(address taker, uint256 bondAmount) public {
@@ -1122,7 +1142,7 @@ contract SeatLeaseAdversarialTest is Base {
         tokenAmount = uint96(bound(tokenAmount, 0, 10_000e18));
         ethAmount = uint96(bound(ethAmount, 0, 10 ether));
         _depositOpen(5000);
-        distributor.setReward(address(lease), tokenAmount, ethAmount);
+        distributor.setReward(_holder(), tokenAmount, ethAmount);
         address[] memory tokens = new address[](1);
         tokens[0] = address(reward);
         vm.prank(owner);
@@ -1156,6 +1176,6 @@ contract SeatLeaseAdversarialTest is Base {
         }
         lease.withdraw(TOKEN_ID);
         bool left = caller == owner && !occupied;
-        assertEq(nft.ownerOf(TOKEN_ID), left ? owner : address(lease));
+        assertEq(nft.ownerOf(TOKEN_ID), left ? owner : _holder());
     }
 }

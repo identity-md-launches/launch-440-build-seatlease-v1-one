@@ -4,6 +4,7 @@ pragma solidity ^0.8.26;
 import {Test} from "forge-std/Test.sol";
 import {StdInvariant} from "forge-std/StdInvariant.sol";
 import {SeatLease} from "../src/SeatLease.sol";
+import {SeatHolder} from "../src/SeatHolder.sol";
 import {MockSeatNFT} from "../src/mocks/MockSeatNFT.sol";
 import {MockERC20} from "../src/mocks/MockERC20.sol";
 import {MockDistributor} from "../src/mocks/MockDistributor.sol";
@@ -37,6 +38,7 @@ contract StatefulHandler is Test {
     // per-seat ghosts
     mapping(uint256 => mapping(address => uint256)) public ghostSeatCredited;
     mapping(uint256 => mapping(address => uint256)) public ghostSeatSwept;
+    mapping(uint256 => mapping(address => mapping(address => uint256))) public ghostShares;
     // bond ghosts
     uint256 public ghostBondIn;
     uint256 public ghostBondReturned;
@@ -87,12 +89,12 @@ contract StatefulHandler is Test {
         bool[] memory heldBefore = new bool[](n);
         bool[] memory occupiedBefore = new bool[](n);
         for (uint256 i; i < n; ++i) {
-            heldBefore[i] = nft.ownerOf(tokenIds[i]) == address(lease);
+            heldBefore[i] = nft.ownerOf(tokenIds[i]) == lease.holderOf(tokenIds[i]);
             occupiedBefore[i] = lease.seat(tokenIds[i]).operator != address(0);
         }
         _;
         for (uint256 i; i < n; ++i) {
-            bool heldAfter = nft.ownerOf(tokenIds[i]) == address(lease);
+            bool heldAfter = nft.ownerOf(tokenIds[i]) == lease.holderOf(tokenIds[i]);
             if (heldBefore[i] && !heldAfter) {
                 nftExits++;
                 if (occupiedBefore[i]) exitWhileOccupied = true;
@@ -121,6 +123,11 @@ contract StatefulHandler is Test {
     }
 
     // ------------------------------------------------------------------ lifecycle
+
+    function passTime(uint256 secs) external tracked {
+        vm.warp(vm.getBlockTimestamp() + bound(secs, 0, 2 hours));
+        vm.roll(vm.getBlockNumber() + 1);
+    }
 
     function deposit(uint256 actorSeed, uint256 tokenSeed, uint16 bps, uint8 mode, uint256 bondAmount, bool withOracle)
         external
@@ -181,6 +188,7 @@ contract StatefulHandler is Test {
         uint256 t = _token(tokenSeed);
         SeatLease.Seat memory s = lease.seat(t);
         if (s.owner == address(0) || s.operator != address(0)) return;
+        if (block.timestamp < s.termsActiveAt) return;
         if (s.mode == SeatLease.Mode.Permissioned && s.allowedOperator != a) return;
         uint256 before = bond.balanceOf(address(lease));
         vm.startPrank(a);
@@ -223,7 +231,7 @@ contract StatefulHandler is Test {
             answerType: 1,
             answer: abi.encode(true),
             figure: 0,
-            fromBlock: 0,
+            fromBlock: s.takenBlock,
             toBlock: uint64(block.number),
             blockHash: bytes32(0),
             panelJobId: bytes32(0),
@@ -267,8 +275,7 @@ contract StatefulHandler is Test {
             lease.credit(t, asset, amount);
         }
         vm.stopPrank();
-        ghostCredited[asset] += amount;
-        ghostSeatCredited[t][asset] += amount;
+        _recordBooking(t, asset, amount);
     }
 
     function claim(uint256 tokenSeed, uint256 amount, uint256 ethAmount, bool listEth) external tracked {
@@ -279,17 +286,29 @@ contract StatefulHandler is Test {
         ethAmount = bound(ethAmount, 0, 1 ether);
         reward.mint(address(distributor), amount);
         vm.deal(address(distributor), address(distributor).balance + ethAmount);
-        distributor.setReward(address(lease), amount, ethAmount);
+        distributor.setReward(lease.holderOf(t), amount, ethAmount);
         address[] memory tokens = new address[](listEth ? 2 : 1);
         tokens[0] = address(reward);
         if (listEth) tokens[1] = address(0);
         vm.prank(s.owner);
         lease.claim(t, address(distributor), abi.encodeCall(MockDistributor.claim, ()), tokens);
-        ghostCredited[address(reward)] += amount;
-        ghostSeatCredited[t][address(reward)] += amount;
-        ghostCredited[address(0)] += ethAmount;
-        ghostSeatCredited[t][address(0)] += ethAmount;
+        _recordBooking(t, address(reward), amount);
+        _recordBooking(t, address(0), ethAmount);
         claims++;
+    }
+
+    /// @dev Record entitlement when the payment arrives; later lifecycle calls never reassign it.
+    function _recordBooking(uint256 t, address asset, uint256 amount) internal {
+        SeatLease.Seat memory s = lease.seat(t);
+        uint256 ownerAmount = s.operator == address(0) ? amount : amount * s.ownerBps / 10_000;
+        ghostShares[t][asset][s.owner] += ownerAmount;
+        if (s.operator != address(0)) ghostShares[t][asset][s.operator] += amount - ownerAmount;
+        ghostCredited[asset] += amount;
+        ghostSeatCredited[t][asset] += amount;
+    }
+
+    function _accountBalance(address asset, address account) internal view returns (uint256) {
+        return asset == address(0) ? account.balance : MockERC20(asset).balanceOf(account);
     }
 
     function sweep(uint256 tokenSeed, uint256 assetSeed, uint256 callerSeed) external tracked {
@@ -297,29 +316,43 @@ contract StatefulHandler is Test {
         address asset = _asset(assetSeed);
         SeatLease.Seat memory s = lease.seat(t);
         if (s.owner == address(0)) return;
-        uint256 amount = lease.credited(t, asset);
+        uint256 ownerAmount = ghostShares[t][asset][s.owner];
+        uint256 operatorAmount =
+            s.operator == address(0) || s.operator == s.owner ? 0 : ghostShares[t][asset][s.operator];
+        uint256 amount = ownerAmount + operatorAmount;
         if (amount == 0) return;
         (address caller,) = _actor(callerSeed);
-        uint256 ownerBefore = asset == address(0) ? s.owner.balance : MockERC20(asset).balanceOf(s.owner);
-        uint256 operatorBefore = s.operator == address(0)
-            ? 0
-            : (asset == address(0) ? s.operator.balance : MockERC20(asset).balanceOf(s.operator));
+        uint256 ownerBefore = _accountBalance(asset, s.owner);
+        uint256 operatorBefore = _accountBalance(asset, s.operator);
         vm.prank(caller);
         lease.sweep(t, asset);
-        uint256 ownerGain = (asset == address(0) ? s.owner.balance : MockERC20(asset).balanceOf(s.owner)) - ownerBefore;
-        uint256 operatorGain = s.operator == address(0)
-            ? 0
-            : (asset == address(0) ? s.operator.balance : MockERC20(asset).balanceOf(s.operator)) - operatorBefore;
-        // Sweep pays exactly the booked amount, split by the terms in force at sweep time.
-        if (s.owner == s.operator) {
-            assertEq(ownerGain, amount, "self-operated sweep");
-        } else {
-            uint256 expectedOwner = s.operator == address(0) ? amount : (amount * s.ownerBps) / 10_000;
-            assertEq(ownerGain, expectedOwner, "owner share");
-            assertEq(operatorGain, amount - expectedOwner, "operator share");
+        uint256 paid = _accountBalance(asset, s.owner) - ownerBefore;
+        assertEq(paid, ownerAmount, "owner's booked share");
+        if (s.operator != s.owner) {
+            uint256 operatorGain = _accountBalance(asset, s.operator) - operatorBefore;
+            assertEq(operatorGain, operatorAmount, "operator's booked share");
+            paid += operatorGain;
         }
-        ghostSwept[asset] += amount;
-        ghostSeatSwept[t][asset] += amount;
+        ghostShares[t][asset][s.owner] = 0;
+        ghostShares[t][asset][s.operator] = 0;
+        ghostSwept[asset] += paid;
+        ghostSeatSwept[t][asset] += paid;
+    }
+
+    /// @dev Includes former owners/operators and withdrawn seats, whose shares must remain claimable.
+    function sweepFor(uint256 tokenSeed, uint256 assetSeed, uint256 accountSeed) external tracked {
+        uint256 t = _token(tokenSeed);
+        address asset = _asset(assetSeed);
+        (address account,) = _actor(accountSeed);
+        uint256 amount = ghostShares[t][asset][account];
+        if (amount == 0) return;
+        uint256 before = _accountBalance(asset, account);
+        lease.sweepFor(t, asset, account);
+        uint256 paid = _accountBalance(asset, account) - before;
+        assertEq(paid, amount, "former participant's booked share");
+        ghostShares[t][asset][account] = 0;
+        ghostSwept[asset] += paid;
+        ghostSeatSwept[t][asset] += paid;
     }
 
     /// @dev Unbooked reward tokens pushed straight to the registry. They belong to nobody and must never be
@@ -351,7 +384,7 @@ contract StatefulHandler is Test {
     function signAuthorization(uint256 actorIndex, uint256 tokenId) external view returns (bytes32, bytes memory) {
         SeatLease.WorkerAuthorization memory a = SeatLease.WorkerAuthorization({
             deviceKey: keccak256(abi.encode("device", actorIndex)),
-            wallet: address(lease),
+            wallet: lease.holderOf(tokenId),
             tokenId: tokenId,
             nonce: keccak256(abi.encode("nonce", block.timestamp)),
             expiresAt: uint64(block.timestamp + 1),
@@ -391,6 +424,62 @@ contract SeatLeaseStatefulInvariantTest is StdInvariant, Test {
         return asset == address(0) ? address(lease).balance : MockERC20(asset).balanceOf(address(lease));
     }
 
+    /// @dev Exercise the handler's revised paths deterministically as well as in random sequences. In
+    ///      particular, old operators' shares survive cuts, term changes, withdrawal and redeposit.
+    function test_handlerCoversTenureChangesAndWithdrawnShareRecovery() public {
+        // token 11 starts with actor 2; actor 0 takes it in Open mode.
+        handler.deposit(2, 0, 5000, 0, 100, true);
+        handler.take(0, 0);
+        handler.credit(1, 0, 0, 100);
+        handler.credit(1, 0, 1, 40);
+        handler.credit(1, 0, 2, 10);
+        handler.claim(0, 20, 10, false);
+        handler.quit(0);
+
+        handler.setTerms(0, 0, 1, 100, true, 1);
+        handler.take(1, 0);
+        assertEq(lease.seat(11).operator, address(0), "terms delay was bypassed");
+        handler.passTime(1 hours);
+        handler.take(1, 0);
+        assertEq(lease.seat(11).operator, handler.actors(1));
+        handler.credit(2, 0, 0, 7);
+        handler.cutByOracle(0, 2);
+        handler.sweep(0, 0, 1);
+        assertEq(reward.balanceOf(handler.actors(0)), 1_000_000e18, "former operator paid by sweep");
+        handler.withdraw(0);
+        invariant_bookedTotalsMatchSeatBookings();
+        invariant_nftCustody();
+        invariant_erc1271MirrorsOperators();
+
+        handler.deposit(2, 0, 5000, 0, 100, true);
+        handler.passTime(1 hours);
+        handler.take(2, 0); // owner operates its own seat; no double payout
+        handler.credit(1, 0, 0, 9);
+        handler.sweep(0, 0, 1);
+        handler.cut(0);
+        handler.withdraw(0);
+        for (uint256 asset; asset < handler.assetCount(); ++asset) {
+            for (uint256 actor; actor < handler.actorCount(); ++actor) {
+                handler.sweepFor(0, asset, actor);
+            }
+            assertEq(lease.credited(11, handler.assets(asset)), 0, "withdrawal stranded shares");
+        }
+        handler.donate(1);
+        assertEq(handler.quits(), 1);
+        assertEq(handler.ownerCuts(), 1);
+        assertEq(handler.oracleCuts(), 1);
+        assertEq(handler.claims(), 1);
+        assertEq(handler.termChanges(), 1);
+        assertEq(handler.depositCalls(), 2);
+        assertEq(handler.withdrawCalls(), 2);
+        invariant_bookedTotalsMatchSeatBookings();
+        invariant_solventPerAsset();
+        invariant_bondOnlyForOccupiedOpenSeats();
+        invariant_nftCustody();
+        invariant_usedRequestsStayUsed();
+        invariant_erc1271MirrorsOperators();
+    }
+
     /// @dev Per asset: the registry's booked total equals the sum of the per-seat bookings, and swept never
     ///      exceeds credited for any seat or in aggregate.
     function invariant_bookedTotalsMatchSeatBookings() public view {
@@ -401,6 +490,14 @@ contract SeatLeaseStatefulInvariantTest is StdInvariant, Test {
                 uint256 t = handler.tokenIds(i);
                 uint256 booked = lease.credited(t, asset);
                 sumSeats += booked;
+                uint256 sumShares;
+                for (uint256 k; k < handler.actorCount(); ++k) {
+                    address account = handler.actors(k);
+                    uint256 expected = handler.ghostShares(t, asset, account);
+                    assertEq(lease.share(t, asset, account), expected, "booking reassigned");
+                    sumShares += expected;
+                }
+                assertEq(sumShares, booked, "shares != seat booking");
                 assertLe(handler.ghostSeatSwept(t, asset), handler.ghostSeatCredited(t, asset), "seat over-swept");
                 assertEq(booked, handler.ghostSeatCredited(t, asset) - handler.ghostSeatSwept(t, asset), "seat booked");
             }
@@ -447,8 +544,9 @@ contract SeatLeaseStatefulInvariantTest is StdInvariant, Test {
         for (uint256 i; i < handler.tokenCount(); ++i) {
             uint256 t = handler.tokenIds(i);
             SeatLease.Seat memory s = lease.seat(t);
-            bool held = nft.ownerOf(t) == address(lease);
+            bool held = nft.ownerOf(t) == lease.holderOf(t);
             assertEq(held, s.owner != address(0), "custody != deposited");
+            assertTrue(nft.ownerOf(t) != address(lease), "registry holds a seat");
             if (!held) {
                 assertEq(s.operator, address(0), "operator on undeposited seat");
                 assertEq(s.bondHeld, 0, "bond on undeposited seat");
@@ -478,6 +576,14 @@ contract SeatLeaseStatefulInvariantTest is StdInvariant, Test {
                 bytes4 expected =
                     operator != address(0) && handler.actors(j) == operator ? bytes4(0x1626ba7e) : bytes4(0xffffffff);
                 assertEq(lease.isValidSignature(digest, blob), expected, "erc1271 disagrees with seat state");
+                address holder = lease.holderOf(t);
+                if (holder != address(0)) {
+                    assertEq(
+                        SeatHolder(payable(holder)).isValidSignature(digest, blob),
+                        expected,
+                        "holder disagrees with registry"
+                    );
+                }
             }
         }
     }
