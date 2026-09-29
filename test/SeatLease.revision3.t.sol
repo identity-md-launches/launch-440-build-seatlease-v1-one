@@ -332,6 +332,47 @@ contract SeatLeaseRevision3Test is Base {
         _assertShares(address(0), 5, 5);
     }
 
+    function test_failedOracleSettlementDoesNotConsumeRequestOrForfeitBond() public {
+        TunableToken token = new TunableToken();
+        _depositOpen(5000);
+        vm.prank(owner);
+        lease.setRewardTokens(TOKEN_ID, _tokens(address(token)));
+        _activateTerms();
+        _takeOpen();
+        _mature();
+        token.mint(_holder(), 10);
+        vm.deal(_holder(), 10);
+        SeatLease.OracleAttestation memory attestation = _goodAttestation(keccak256("settlement-retry"));
+        bytes memory signature = _signAttestation(oracleKey, attestation);
+        token.setBehaviour(address(lease), TunableToken.Behaviour.Revert);
+
+        vm.prank(stranger);
+        vm.expectRevert("blocked");
+        lease.cutByOracle(TOKEN_ID, attestation, signature);
+        assertFalse(lease.usedRequest(attestation.requestId));
+        assertEq(lease.seat(TOKEN_ID).operator, operator);
+        assertEq(lease.seat(TOKEN_ID).bondHeld, BOND_AMOUNT);
+        assertEq(bond.balanceOf(owner), 0);
+        assertEq(bond.balanceOf(address(lease)), BOND_AMOUNT);
+        assertEq(lease.totalCredited(address(token)), 0);
+        assertEq(lease.totalCredited(address(0)), 0);
+        assertEq(token.balanceOf(_holder()), 10);
+        assertEq(_holder().balance, 10);
+        assertEq(nft.ownerOf(TOKEN_ID), _holder());
+
+        token.setBehaviour(address(lease), TunableToken.Behaviour.Normal);
+        vm.prank(stranger);
+        lease.cutByOracle(TOKEN_ID, attestation, signature);
+        assertTrue(lease.usedRequest(attestation.requestId));
+        assertEq(lease.seat(TOKEN_ID).operator, address(0));
+        assertEq(lease.seat(TOKEN_ID).bondHeld, 0);
+        assertEq(bond.balanceOf(owner), BOND_AMOUNT);
+        _assertShares(address(token), 5, 5);
+        _assertShares(address(0), 5, 5);
+        assertEq(token.balanceOf(_holder()), 0);
+        assertEq(_holder().balance, 0);
+    }
+
     function test_sweepForPaysHeavyReceiverAfterBoundedSweepRetainsShare() public {
         HeavyRewardReceiver receiver = new HeavyRewardReceiver();
         _depositPermissioned(0);

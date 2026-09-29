@@ -385,6 +385,8 @@ contract SeatLeaseAdversarialTest is Base {
     function test_claim_bondTokenRewardIsBookedApartFromHeldBond() public {
         _depositOpen(5000);
         _takeOpen();
+        // Exercise the normal split after holder-collection warm-up.
+        vm.warp(vm.getBlockTimestamp() + lease.TERMS_DELAY());
         BondPayingDistributor payer = new BondPayingDistributor(bond);
         bond.mint(address(payer), 40);
         address[] memory tokens = new address[](1);
@@ -521,7 +523,7 @@ contract SeatLeaseAdversarialTest is Base {
         vm.expectRevert(
             abi.encodeWithSelector(
                 SeatLease.ClaimFailed.selector,
-                abi.encodeWithSelector(SeatLease.NotSeatOwner.selector, TOKEN_ID, address(re))
+                abi.encodeWithSelector(ReentrancyGuard.ReentrancyGuardReentrantCall.selector)
             )
         );
         lease.claim(TOKEN_ID, address(re), abi.encodeCall(ReentrantDistributor.claim, ()), new address[](0));

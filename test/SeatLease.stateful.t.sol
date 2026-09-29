@@ -35,10 +35,14 @@ contract StatefulHandler is Test {
     mapping(address => uint256) public ghostCredited;
     mapping(address => uint256) public ghostSwept;
     mapping(address => uint256) public ghostDonated;
+    mapping(address => uint256) public ghostDirectCredited;
+    mapping(address => uint256) public ghostHolderFunded;
     // per-seat ghosts
     mapping(uint256 => mapping(address => uint256)) public ghostSeatCredited;
     mapping(uint256 => mapping(address => uint256)) public ghostSeatSwept;
     mapping(uint256 => mapping(address => mapping(address => uint256))) public ghostShares;
+    mapping(uint256 => mapping(address => uint256)) public ghostHolderPending;
+    mapping(uint256 => mapping(address => bool)) public ghostDeclared;
     // bond ghosts
     uint256 public ghostBondIn;
     uint256 public ghostBondReturned;
@@ -57,6 +61,7 @@ contract StatefulHandler is Test {
     uint256 public quits;
     uint256 public claims;
     uint256 public termChanges;
+    uint256 public holderCollections;
 
     constructor(SeatLease lease_, MockSeatNFT nft_, MockERC20 bond_, MockERC20 reward_, MockDistributor d) {
         lease = lease_;
@@ -190,12 +195,15 @@ contract StatefulHandler is Test {
         if (s.owner == address(0) || s.operator != address(0)) return;
         if (block.timestamp < s.termsActiveAt) return;
         if (s.mode == SeatLease.Mode.Permissioned && s.allowedOperator != a) return;
-        uint256 before = bond.balanceOf(address(lease));
+        // Settlement can bring bond-token rewards into the registry during this call.
+        // Measure the taker's debit separately from that reward inflow.
+        uint256 before = bond.balanceOf(a);
+        _recordSettlement(t);
         vm.startPrank(a);
         bond.approve(address(lease), s.bondAmount);
         lease.take(t);
         vm.stopPrank();
-        ghostBondIn += bond.balanceOf(address(lease)) - before;
+        ghostBondIn += before - bond.balanceOf(a);
     }
 
     function quit(uint256 tokenSeed) external tracked {
@@ -203,6 +211,7 @@ contract StatefulHandler is Test {
         SeatLease.Seat memory s = lease.seat(t);
         if (s.operator == address(0)) return;
         uint256 before = bond.balanceOf(s.operator);
+        _recordSettlement(t);
         vm.prank(s.operator);
         lease.quit(t);
         ghostBondReturned += bond.balanceOf(s.operator) - before;
@@ -214,6 +223,7 @@ contract StatefulHandler is Test {
         SeatLease.Seat memory s = lease.seat(t);
         if (s.operator == address(0)) return;
         uint256 before = bond.balanceOf(s.operator);
+        _recordSettlement(t);
         vm.prank(s.owner);
         lease.cut(t);
         ghostBondReturned += bond.balanceOf(s.operator) - before;
@@ -241,6 +251,7 @@ contract StatefulHandler is Test {
         (uint8 v, bytes32 r, bytes32 sg) = vm.sign(oracleKey, lease.hashOracleAttestation(att));
         (address caller,) = _actor(callerSeed);
         uint256 before = bond.balanceOf(s.owner);
+        _recordSettlement(t);
         vm.prank(caller);
         lease.cutByOracle(t, att, abi.encodePacked(r, sg, v));
         ghostBondForfeited += bond.balanceOf(s.owner) - before;
@@ -253,8 +264,11 @@ contract StatefulHandler is Test {
         SeatLease.Seat memory s = lease.seat(t);
         if (s.owner == address(0) || s.operator != address(0)) return;
         inWithdraw = true; // cleared by `tracked` after the custody check
+        _recordSettlement(t);
         vm.prank(s.owner);
         lease.withdraw(t);
+        ghostDeclared[t][address(reward)] = false;
+        ghostDeclared[t][address(bond)] = false;
         withdrawCalls++;
     }
 
@@ -275,7 +289,8 @@ contract StatefulHandler is Test {
             lease.credit(t, asset, amount);
         }
         vm.stopPrank();
-        _recordBooking(t, asset, amount);
+        ghostDirectCredited[asset] += amount;
+        _recordBooking(t, asset, amount, false);
     }
 
     function claim(uint256 tokenSeed, uint256 amount, uint256 ethAmount, bool listEth) external tracked {
@@ -290,19 +305,79 @@ contract StatefulHandler is Test {
         address[] memory tokens = new address[](listEth ? 2 : 1);
         tokens[0] = address(reward);
         if (listEth) tokens[1] = address(0);
+        _recordHolderFunding(t, address(reward), amount);
+        _recordHolderFunding(t, address(0), ethAmount);
+        _recordHolderCollection(t, address(reward));
+        _recordHolderCollection(t, address(0));
         vm.prank(s.owner);
         lease.claim(t, address(distributor), abi.encodeCall(MockDistributor.claim, ()), tokens);
-        _recordBooking(t, address(reward), amount);
-        _recordBooking(t, address(0), ethAmount);
         claims++;
     }
 
-    /// @dev Record entitlement when the payment arrives; later lifecycle calls never reassign it.
-    function _recordBooking(uint256 t, address asset, uint256 amount) internal {
+    /// @dev Reward-list changes can leave an unlisted balance pending for a later explicit skim.
+    function setRewardTokens(uint256 tokenSeed, bool includeReward, bool includeBond) external tracked {
+        uint256 t = _token(tokenSeed);
         SeatLease.Seat memory s = lease.seat(t);
-        uint256 ownerAmount = s.operator == address(0) ? amount : amount * s.ownerBps / 10_000;
+        if (s.owner == address(0) || s.operator != address(0)) return;
+        address[] memory tokens = new address[]((includeReward ? 1 : 0) + (includeBond ? 1 : 0));
+        uint256 i;
+        if (includeReward) tokens[i++] = address(reward);
+        if (includeBond) tokens[i] = address(bond);
+        vm.prank(s.owner);
+        lease.setRewardTokens(t, tokens);
+        ghostDeclared[t][address(reward)] = includeReward;
+        ghostDeclared[t][address(bond)] = includeBond;
+    }
+
+    /// @dev Leave funds in the holder across later takes, claims, exits and withdrawals.
+    function pushToHolder(uint256 tokenSeed, uint256 assetSeed, uint256 amount) external tracked {
+        uint256 t = _token(tokenSeed);
+        if (lease.seat(t).owner == address(0)) return;
+        address asset = _asset(assetSeed);
+        address holder = lease.holderOf(t);
+        amount = bound(amount, 1, 10 ether);
+        if (asset == address(0)) vm.deal(holder, holder.balance + amount);
+        else MockERC20(asset).mint(holder, amount);
+        _recordHolderFunding(t, asset, amount);
+    }
+
+    function skim(uint256 tokenSeed, uint256 assetSeed) external tracked {
+        uint256 t = _token(tokenSeed);
+        address asset = _asset(assetSeed);
+        if (lease.seat(t).owner == address(0) || ghostHolderPending[t][asset] == 0) return;
+        _recordHolderCollection(t, asset);
+        lease.skim(t, asset);
+    }
+
+    function _recordHolderFunding(uint256 t, address asset, uint256 amount) internal {
+        ghostHolderFunded[asset] += amount;
+        ghostHolderPending[t][asset] += amount;
+    }
+
+    function _recordHolderCollection(uint256 t, address asset) internal {
+        uint256 amount = ghostHolderPending[t][asset];
+        if (amount == 0) return;
+        ghostHolderPending[t][asset] = 0;
+        _recordBooking(t, asset, amount, true);
+        holderCollections++;
+    }
+
+    function _recordSettlement(uint256 t) internal {
+        for (uint256 i; i < assets.length; ++i) {
+            address asset = assets[i];
+            if (asset == address(0) || ghostDeclared[t][asset]) _recordHolderCollection(t, asset);
+        }
+    }
+
+    /// @dev Record entitlement when the payment arrives; later lifecycle calls never reassign it.
+    function _recordBooking(uint256 t, address asset, uint256 amount, bool holderCollection) internal {
+        SeatLease.Seat memory s = lease.seat(t);
+        // Direct credits split immediately. Holder collections during warm-up belong to the owner.
+        bool shareWithOperator = s.operator != address(0)
+            && (!holderCollection || block.timestamp >= uint256(s.takenAt) + lease.TERMS_DELAY());
+        uint256 ownerAmount = shareWithOperator ? amount * s.ownerBps / 10_000 : amount;
         ghostShares[t][asset][s.owner] += ownerAmount;
-        if (s.operator != address(0)) ghostShares[t][asset][s.operator] += amount - ownerAmount;
+        if (shareWithOperator) ghostShares[t][asset][s.operator] += amount - ownerAmount;
         ghostCredited[asset] += amount;
         ghostSeatCredited[t][asset] += amount;
     }
@@ -478,6 +553,105 @@ contract SeatLeaseStatefulInvariantTest is StdInvariant, Test {
         invariant_nftCustody();
         invariant_usedRequestsStayUsed();
         invariant_erc1271MirrorsOperators();
+    }
+
+    function test_handlerDistinguishesDirectCreditFromHolderWarmup() public {
+        handler.deposit(2, 0, 5000, 0, 100, true);
+        handler.take(0, 0);
+        // Direct credit shares immediately; a claim during warm-up belongs to the owner.
+        handler.credit(1, 0, 0, 10);
+        handler.claim(0, 10, 10, false);
+        assertEq(lease.share(11, address(reward), handler.actors(2)), 15);
+        assertEq(lease.share(11, address(reward), handler.actors(0)), 5);
+        assertEq(lease.share(11, address(0), handler.actors(2)), 10);
+        assertEq(lease.share(11, address(0), handler.actors(0)), 0);
+
+        handler.passTime(1 hours - 1);
+        handler.pushToHolder(0, 0, 10);
+        handler.skim(0, 0);
+        assertEq(lease.share(11, address(reward), handler.actors(0)), 5);
+        handler.passTime(1);
+        handler.pushToHolder(0, 0, 11);
+        handler.claim(0, 9, 10, true); // Pending 11 + claimed 9 is one collection of 20.
+        assertEq(lease.share(11, address(reward), handler.actors(2)), 35);
+        assertEq(lease.share(11, address(reward), handler.actors(0)), 15);
+        assertEq(lease.share(11, address(0), handler.actors(2)), 15);
+        assertEq(lease.share(11, address(0), handler.actors(0)), 5);
+        invariant_holderFundingIsConserved();
+        invariant_bookedTotalsMatchSeatBookings();
+        invariant_solventPerAsset();
+    }
+
+    function test_handlerSettlesAllAssetsAcrossTakeExitAndWithdraw() public {
+        // Each seat uses a different exit route: quit, owner cut, then oracle cut.
+        for (uint256 i; i < 3; ++i) {
+            uint256 ownerIndex = (11 + i) % 3;
+            uint256 operatorIndex = (ownerIndex + 1) % 3;
+            uint256 t = 11 + i;
+            handler.deposit(ownerIndex, i, 5000, 0, 100, true);
+            handler.setRewardTokens(i, true, true);
+            handler.passTime(1 hours);
+            for (uint256 asset; asset < 3; ++asset) {
+                handler.pushToHolder(i, asset, 10);
+            }
+            handler.take(operatorIndex, i); // Vacant funds belong wholly to the owner.
+            handler.passTime(1 hours);
+            for (uint256 asset; asset < 3; ++asset) {
+                handler.pushToHolder(i, asset, 11);
+            }
+            if (i == 0) handler.quit(i);
+            else if (i == 1) handler.cut(i);
+            else handler.cutByOracle(i, operatorIndex);
+            for (uint256 asset; asset < 3; ++asset) {
+                address token = handler.assets(asset);
+                assertEq(lease.share(t, token, handler.actors(ownerIndex)), 15);
+                assertEq(lease.share(t, token, handler.actors(operatorIndex)), 6);
+                handler.pushToHolder(i, asset, 7);
+            }
+            handler.withdraw(i); // Vacant funds must settle before clearing the owner.
+            for (uint256 asset; asset < 3; ++asset) {
+                address token = handler.assets(asset);
+                assertEq(lease.share(t, token, handler.actors(ownerIndex)), 22);
+                handler.sweepFor(i, asset, ownerIndex);
+                handler.sweepFor(i, asset, operatorIndex);
+                assertEq(lease.credited(t, token), 0);
+            }
+        }
+        assertEq(handler.quits(), 1);
+        assertEq(handler.ownerCuts(), 1);
+        assertEq(handler.oracleCuts(), 1);
+        assertEq(handler.holderCollections(), 27);
+        assertEq(handler.ghostBondIn(), 300);
+        assertEq(handler.ghostBondReturned(), 200);
+        assertEq(handler.ghostBondForfeited(), 100);
+        invariant_holderFundingIsConserved();
+        invariant_bookedTotalsMatchSeatBookings();
+        invariant_solventPerAsset();
+        invariant_nftCustody();
+    }
+
+    /// @dev Compare input-derived pending balances against actual holder custody, including unlisted tokens.
+    ///      Every funded unit is either pending, booked, or paid; moving it between wallets cannot create value.
+    function invariant_holderFundingIsConserved() public view {
+        for (uint256 j; j < handler.assetCount(); ++j) {
+            address asset = handler.assets(j);
+            uint256 pending;
+            for (uint256 i; i < handler.tokenCount(); ++i) {
+                uint256 t = handler.tokenIds(i);
+                uint256 expected = handler.ghostHolderPending(t, asset);
+                address holder = lease.holderOf(t);
+                uint256 actual = holder == address(0)
+                    ? 0
+                    : (asset == address(0) ? holder.balance : MockERC20(asset).balanceOf(holder));
+                assertEq(actual, expected, "holder funds lost or collected twice");
+                pending += expected;
+            }
+            assertEq(
+                handler.ghostDirectCredited(asset) + handler.ghostHolderFunded(asset),
+                pending + lease.totalCredited(asset) + handler.ghostSwept(asset),
+                "funding != pending + booked + paid"
+            );
+        }
     }
 
     /// @dev Per asset: the registry's booked total equals the sum of the per-seat bookings, and swept never
