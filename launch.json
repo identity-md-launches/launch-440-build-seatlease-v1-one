@@ -1,0 +1,17 @@
+{
+  "kind": "evm_project",
+  "token": {
+    "contract": "LaunchToken",
+    "name": "SeatLease",
+    "symbol": "SEATL",
+    "decimals": 18
+  },
+  "pool": {
+    "pairedCurrency": "0x0000000000000000000000000000000000000000",
+    "fee": 3000,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "contracts": [],
+  "notes": "SEATLEASE v1 launch manifest. This is a token-only launch: the factory deploys LaunchToken (src/LaunchToken.sol, fixed supply of 1,000,000,000 SEATL at 18 decimals, minted to msg.sender, no mint/owner/pause/upgrade path) and supplies the LP and MerkleDistributor. No application contract is listed because SeatLease (src/SeatLease.sol) cannot be instantiated through ProjectFactory: its constructor is (address seatNFT, address bondToken, string workerDomainName, string workerDomainVersion). The two string parameters are dynamic ABI types, which constructorArgs do not support, and the seat NFT and bond ERC-20 are pre-existing network contracts whose addresses are chain-specific deployment inputs, not factory outputs. SeatHolder (src/SeatHolder.sol) is the second contract in the tree: one per deposited seat, created by SeatLease.deposit with CREATE2 (salt = tokenId) and administered only by that registry, because its constructor records msg.sender as the registry. It is not listed either: a factory-deployed SeatHolder would name ProjectFactory as its registry and could never be used, and the accepted implementation creates every holder itself. The mocks under src/mocks (MockSeatNFT, MockERC20, MockDistributor) are test scaffolding and are intentionally not launched. SeatLease is deployed instead with script/Deploy.s.sol, which is driven by environment variables (SEAT_NFT, BOND_TOKEN, WORKER_DOMAIN_NAME default \"IdentityMD Worker\", WORKER_DOMAIN_VERSION default \"2\", PRIVATE_KEY, DEPLOY_MOCKS for non-mainnet mock deployment) and is usable unchanged on mainnet: forge script script/Deploy.s.sol --rpc-url $RPC_URL --broadcast. SeatLease has no owner, admin, pause, upgrade or selfdestruct; the token is not used by SeatLease, whose bond token is whatever ERC-20 the deployer names. Pool: native ETH pair, fee 3000, tickSpacing 60, sqrtPriceX96 1:1 placeholder; the deployer derives the effective opening price from the pinned policy when it specifies initialMarketCapWei."
+}
