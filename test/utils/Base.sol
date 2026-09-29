@@ -78,12 +78,23 @@ abstract contract Base is Test {
         lease.take(TOKEN_ID);
     }
 
+    /// @dev The wallet that holds seat 7; zero until the first deposit.
+    function _holder() internal view returns (address) {
+        return lease.holderOf(TOKEN_ID);
+    }
+
+    /// @dev Moves past the terms-activation delay that follows `setTerms` and `withdraw`.
+    function _activateTerms() internal {
+        vm.warp(vm.getBlockTimestamp() + lease.TERMS_DELAY());
+    }
+
     // ------------------------------------------------------------------ signing helpers
 
+    /// @dev An authorization for `tokenId` naming its holder (the seat's wallet) as `wallet`.
     function _auth(uint256 tokenId, uint64 expiresAt) internal view returns (SeatLease.WorkerAuthorization memory) {
         return SeatLease.WorkerAuthorization({
             deviceKey: keccak256("device"),
-            wallet: address(lease),
+            wallet: lease.holderOf(tokenId),
             tokenId: tokenId,
             nonce: keccak256("nonce"),
             expiresAt: expiresAt,
@@ -143,12 +154,12 @@ abstract contract Base is Test {
             answerType: answerType,
             answer: answer,
             figure: 0,
-            fromBlock: uint64(block.number > 10 ? block.number - 10 : 0),
+            fromBlock: uint64(block.number),
             toBlock: uint64(block.number),
             blockHash: blockhash(block.number - 1),
             panelJobId: keccak256("panel"),
-            issuedAt: uint64(block.timestamp),
-            expiresAt: uint64(block.timestamp + 1 hours)
+            issuedAt: uint64(vm.getBlockTimestamp()),
+            expiresAt: uint64(vm.getBlockTimestamp() + 1 hours)
         });
     }
 

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-import {ERC721Holder} from "@openzeppelin/contracts/token/ERC721/utils/ERC721Holder.sol";
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -10,14 +9,17 @@ import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {SeatHolder} from "./SeatHolder.sol";
 
 /// @title SeatLease v1
-/// @notice A registry that holds IdentityMD seats (ERC-721) so a seat owner can let an operator run the seat
-///         while both share the rewards that the network pays to the seat holder (this contract).
-/// @dev No upgradeability, no global admin, no pause, no selfdestruct. Every seat is administered by the
-///      address that deposited it. The contract answers ERC-1271 `isValidSignature` for the current operator of
-///      the seat named inside the WorkerAuthorization so the network can pair a device to a leased seat.
-contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
+/// @notice A registry that lets the owner of an IdentityMD seat (ERC-721) let an operator run the seat while both
+///         share the rewards the network pays to the seat's wallet.
+/// @dev No upgradeability, no global admin, no pause, no selfdestruct. Every seat is administered by the address
+///      that deposited it. Each deposited seat is held by its own `SeatHolder`, a wallet the registry controls, so
+///      the rewards a distributor pays to that wallet belong to that seat alone. The holder answers ERC-1271
+///      `isValidSignature` for the seat's current operator by deferring to this contract, so the network can pair a
+///      device to a leased seat. Rewards booked to a seat are split between owner and operator at booking time.
+contract SeatLease is IERC1271, EIP712, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     // ---------------------------------------------------------------------------------------------
@@ -44,9 +46,14 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
         address oracleSigner;
         bytes32 questionHash;
         string listing;
+        /// @dev `take` is refused before this timestamp. Set to now + TERMS_DELAY by `setTerms` and `withdraw`.
+        uint64 termsActiveAt;
+        /// @dev When and at which block the current operator took the seat; zero while vacant.
+        uint64 takenAt;
+        uint64 takenBlock;
     }
 
-    /// @notice The network's device pairing message. `wallet` must be this contract.
+    /// @notice The network's device pairing message. `wallet` must be the seat's holder.
     struct WorkerAuthorization {
         bytes32 deviceKey;
         address wallet;
@@ -83,6 +90,13 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
     uint256 public constant MAX_LISTING_BYTES = 280;
     /// @notice `answerType` value the oracle uses for boolean answers.
     uint8 public constant ANSWER_TYPE_BOOL = 1;
+    /// @notice How long after `setTerms` (or `withdraw`) a seat's terms must stand before anyone can take it.
+    ///         An operator whose `take` lands within this window of reading active terms is seated under exactly
+    ///         those terms or not at all.
+    uint64 public constant TERMS_DELAY = 1 hours;
+    /// @notice Gas forwarded when `sweep` pushes ETH. A recipient that needs more, or that reverts, keeps its
+    ///         share booked and collects it later with `sweepFor`.
+    uint256 public constant SWEEP_ETH_GAS = 100_000;
     /// @notice ERC-1271 success value.
     bytes4 public constant MAGIC_VALUE = 0x1626ba7e;
     /// @notice ERC-1271 failure value.
@@ -101,7 +115,7 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
         "OracleAttestation(bytes32 requestId,uint256 chainId,bytes32 questionHash,uint8 answerType,bytes answer,uint256 figure,uint64 fromBlock,uint64 toBlock,bytes32 blockHash,bytes32 panelJobId,uint64 issuedAt,uint64 expiresAt)"
     );
 
-    /// @notice The seat NFT this registry holds.
+    /// @notice The seat NFT this registry leases.
     IERC721 public immutable seatNFT;
     /// @notice The ERC-20 posted as a bond by operators of Open seats.
     IERC20 public immutable bondToken;
@@ -116,23 +130,29 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
     // ---------------------------------------------------------------------------------------------
 
     mapping(uint256 tokenId => Seat) private _seats;
+    /// @dev The wallet of each seat, created on first deposit and reused for every later deposit of the token id.
+    mapping(uint256 tokenId => SeatHolder) private _holders;
+    /// @dev Unswept booked balance of a seat per token; the sum of that seat's `_shares` for the token.
     mapping(uint256 tokenId => mapping(address token => uint256 amount)) private _credited;
+    /// @dev What each account is owed out of a seat's booked balance, fixed at booking time.
+    mapping(uint256 tokenId => mapping(address token => mapping(address account => uint256 amount))) private _shares;
     mapping(bytes32 requestId => bool used) private _usedRequests;
-    /// @notice Total amount of `token` booked to seats. Backs the `claim` target guard and the sweep invariant.
+    /// @notice Total amount of `token` booked to seats and not yet paid out.
     mapping(address token => uint256 amount) public totalCredited;
     /// @notice Bond that could not be pushed to `account` and waits for `redeemBond`.
     mapping(address account => uint256 amount) public bondOwed;
 
-    /// @dev Token id whose deposit is in flight; `onERC721Received` accepts only that token from the seat NFT.
+    /// @dev Token id whose deposit is in flight; its holder accepts the seat NFT only while this is set.
     uint256 private _depositing;
     bool private _depositActive;
-    /// @dev True while `claim` runs; the only window in which `receive` accepts ETH.
-    bool private _claimActive;
+    /// @dev True while a holder forwards ETH to the registry; the only window in which `receive` accepts ETH.
+    bool private _collecting;
 
     // ---------------------------------------------------------------------------------------------
     // Events
     // ---------------------------------------------------------------------------------------------
 
+    event HolderCreated(uint256 indexed tokenId, address indexed holder);
     event SeatDeposited(uint256 indexed tokenId, address indexed owner);
     event TermsSet(
         uint256 indexed tokenId,
@@ -142,7 +162,8 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
         uint256 bondAmount,
         address oracleSigner,
         bytes32 questionHash,
-        string listing
+        string listing,
+        uint64 activeAt
     );
     event SeatTaken(uint256 indexed tokenId, address indexed operator, uint256 bondHeld);
     event SeatQuit(uint256 indexed tokenId, address indexed operator, uint256 bondReturned);
@@ -153,7 +174,9 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
     event SeatWithdrawn(uint256 indexed tokenId, address indexed owner);
     event Credited(uint256 indexed tokenId, address indexed token, address indexed from, uint256 amount);
     event Claimed(uint256 indexed tokenId, address indexed target, bytes data);
+    event Skimmed(uint256 indexed tokenId, address indexed token, uint256 amount);
     event Booked(uint256 indexed tokenId, address indexed token, uint256 amount);
+    event ShareAccrued(uint256 indexed tokenId, address indexed token, address indexed account, uint256 amount);
     event Swept(
         uint256 indexed tokenId,
         address indexed token,
@@ -162,6 +185,8 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
         address operator,
         uint256 operatorAmount
     );
+    event SharePaid(uint256 indexed tokenId, address indexed token, address indexed account, uint256 amount);
+    event ShareRetained(uint256 indexed tokenId, address indexed token, address indexed account, uint256 amount);
     event BondEscrowed(address indexed account, uint256 amount);
     event BondRedeemed(address indexed account, uint256 amount);
 
@@ -177,9 +202,9 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
     error SeatAlreadyDeposited(uint256 tokenId);
     error SeatNotVacant(uint256 tokenId);
     error SeatVacant(uint256 tokenId);
+    error TermsNotActive(uint256 tokenId, uint64 activeAt);
     error InvalidBps(uint16 ownerBps);
     error ListingTooLong(uint256 length);
-    error UnexpectedToken(address collection, uint256 tokenId);
     error NftNotReceived(uint256 tokenId);
     error NftNotHeld(uint256 tokenId);
     error NoOracle(uint256 tokenId);
@@ -188,6 +213,8 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
     error OracleAnswerNotBool(uint8 answerType);
     error OracleAnswerNotTrue();
     error OracleAttestationExpired(uint64 expiresAt);
+    error OracleAttestationPredatesTenure(uint64 issuedAt, uint64 takenAt);
+    error OracleWindowPredatesTenure(uint64 fromBlock, uint64 takenBlock);
     error OracleRequestUsed(bytes32 requestId);
     error OracleSignerMismatch(address expected, address actual);
     error WrongValue(uint256 expected, uint256 actual);
@@ -195,8 +222,7 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
     error ForbiddenTarget(address target);
     error ForbiddenToken(address token);
     error ClaimFailed(bytes reason);
-    error BookedBalanceDecreased(address token, uint256 before, uint256 afterwards);
-    error EthTransferFailed(address to, uint256 amount);
+    error HolderBalanceDecreased(address token, uint256 before, uint256 afterwards);
     error NothingOwed(address account);
     error DirectEthNotAccepted();
     error MalformedAuthorization();
@@ -221,20 +247,23 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
         _workerVersionHash = keccak256(bytes(workerDomainVersion));
     }
 
-    /// @dev Plain ETH is refused so it can never sit unattributed. Use `credit(tokenId, address(0), amount)`.
-    ///      The only exception is ETH arriving while `claim` runs: `claim` measures and books every wei of it.
+    /// @dev Plain ETH is refused so it can never sit unattributed. Use `credit(tokenId, address(0), amount)`, or
+    ///      pay the seat's holder and let anyone `skim` it. The only exception is ETH a holder forwards while the
+    ///      registry collects it, every wei of which is booked to that holder's seat.
     receive() external payable {
-        if (!_claimActive) revert DirectEthNotAccepted();
+        if (!_collecting) revert DirectEthNotAccepted();
     }
 
     // ---------------------------------------------------------------------------------------------
     // Seat lifecycle
     // ---------------------------------------------------------------------------------------------
 
-    /// @notice Deposit a seat you own and record its lease terms.
+    /// @notice Deposit a seat you own and record its lease terms. The seat moves into its own holder, which is
+    ///         created on the first deposit of the token id and reused afterwards.
     /// @dev The oracle attestation carries no tokenId, so an attestation for `questionHash` is valid for every seat
     ///      that shares that hash and `oracleSigner`. Give each seat its own question (for example, include the
     ///      tokenId in the question text the oracle answers) so an attestation can only cut the seat it was issued for.
+    ///      Terms recorded here are live at once unless the token id was withdrawn less than `TERMS_DELAY` ago.
     function deposit(
         uint256 tokenId,
         uint16 ownerBps,
@@ -249,18 +278,30 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
         if (s.owner != address(0)) revert SeatAlreadyDeposited(tokenId);
         if (seatNFT.ownerOf(tokenId) != msg.sender) revert NotSeatOwner(tokenId, msg.sender);
 
+        SeatHolder holder = _holders[tokenId];
+        if (address(holder) == address(0)) {
+            holder = new SeatHolder{salt: bytes32(tokenId)}(seatNFT, tokenId);
+            _holders[tokenId] = holder;
+            emit HolderCreated(tokenId, address(holder));
+        }
+
         s.owner = msg.sender;
         emit SeatDeposited(tokenId, msg.sender);
-        _setTerms(s, tokenId, ownerBps, mode, allowedOperator, bondAmount, oracleSigner, questionHash, listing);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint64 activeAt = s.termsActiveAt > block.timestamp ? s.termsActiveAt : uint64(block.timestamp);
+        _setTerms(
+            s, tokenId, ownerBps, mode, allowedOperator, bondAmount, oracleSigner, questionHash, listing, activeAt
+        );
 
         _depositing = tokenId;
         _depositActive = true;
-        seatNFT.safeTransferFrom(msg.sender, address(this), tokenId);
+        seatNFT.safeTransferFrom(msg.sender, address(holder), tokenId);
         _depositActive = false;
-        if (seatNFT.ownerOf(tokenId) != address(this)) revert NftNotReceived(tokenId);
+        if (seatNFT.ownerOf(tokenId) != address(holder)) revert NftNotReceived(tokenId);
     }
 
-    /// @notice Change the terms of a vacant seat you deposited.
+    /// @notice Change the terms of a vacant seat you deposited. The new terms can be taken after `TERMS_DELAY`, so a
+    ///         change can never land between an operator reading the terms and its `take` executing.
     function setTerms(
         uint256 tokenId,
         uint16 ownerBps,
@@ -273,14 +314,20 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
     ) external {
         Seat storage s = _onlyOwner(tokenId);
         if (s.operator != address(0)) revert SeatNotVacant(tokenId);
-        _setTerms(s, tokenId, ownerBps, mode, allowedOperator, bondAmount, oracleSigner, questionHash, listing);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint64 activeAt = uint64(block.timestamp + TERMS_DELAY);
+        _setTerms(
+            s, tokenId, ownerBps, mode, allowedOperator, bondAmount, oracleSigner, questionHash, listing, activeAt
+        );
     }
 
-    /// @notice Become the operator of a vacant seat. Open seats pull `bondAmount` of the bond token from the caller.
+    /// @notice Become the operator of a vacant seat whose terms are active. Open seats pull `bondAmount` of the bond
+    ///         token from the caller.
     function take(uint256 tokenId) external nonReentrant {
         Seat storage s = _seats[tokenId];
         if (s.owner == address(0)) revert SeatNotDeposited(tokenId);
         if (s.operator != address(0)) revert SeatNotVacant(tokenId);
+        if (block.timestamp < s.termsActiveAt) revert TermsNotActive(tokenId, s.termsActiveAt);
 
         uint256 held = 0;
         if (s.mode == Mode.Permissioned) {
@@ -293,10 +340,14 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
 
         s.operator = msg.sender;
         s.bondHeld = held;
+        // forge-lint: disable-next-line(unsafe-typecast)
+        s.takenAt = uint64(block.timestamp);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        s.takenBlock = uint64(block.number);
         emit SeatTaken(tokenId, msg.sender, held);
     }
 
-    /// @notice Leave a seat you operate. Your bond is returned.
+    /// @notice Leave a seat you operate. Your bond is returned. Shares already booked to you stay yours.
     function quit(uint256 tokenId) external nonReentrant {
         Seat storage s = _seats[tokenId];
         if (msg.sender != s.operator) revert NotOperator(tokenId, msg.sender);
@@ -305,7 +356,8 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
         _payBond(msg.sender, held);
     }
 
-    /// @notice Remove the operator of a seat you deposited. The operator's bond is returned to them.
+    /// @notice Remove the operator of a seat you deposited. The operator's bond is returned to them and the shares
+    ///         already booked to them stay theirs.
     function cut(uint256 tokenId) external nonReentrant {
         Seat storage s = _onlyOwner(tokenId);
         address operator = s.operator;
@@ -317,6 +369,8 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
 
     /// @notice Remove the operator of a seat on the strength of a signed oracle attestation that answers the
     ///         seat's question with `true`. The operator's bond is forfeited to the seat owner.
+    /// @dev The attestation must have been issued, and its observation window must start, no earlier than the
+    ///      current operator took the seat, so an attestation about a previous operator can never cut this one.
     function cutByOracle(uint256 tokenId, OracleAttestation calldata attestation, bytes calldata signature)
         external
         nonReentrant
@@ -336,6 +390,10 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
             revert OracleAnswerNotTrue();
         }
         if (attestation.expiresAt <= block.timestamp) revert OracleAttestationExpired(attestation.expiresAt);
+        if (attestation.issuedAt < s.takenAt) revert OracleAttestationPredatesTenure(attestation.issuedAt, s.takenAt);
+        if (attestation.fromBlock < s.takenBlock) {
+            revert OracleWindowPredatesTenure(attestation.fromBlock, s.takenBlock);
+        }
         if (_usedRequests[attestation.requestId]) revert OracleRequestUsed(attestation.requestId);
         address recovered = ECDSA.recover(hashOracleAttestation(attestation), signature);
         if (recovered != signer) revert OracleSignerMismatch(signer, recovered);
@@ -346,13 +404,18 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
         _payBond(s.owner, held);
     }
 
-    /// @notice Take back a vacant seat you deposited. Sweep any booked balances first; they stay with the tokenId.
+    /// @notice Take back a vacant seat you deposited. Booked shares stay with the accounts they were booked to and
+    ///         can still be collected with `sweepFor`. The token id cannot be taken again until `TERMS_DELAY` after
+    ///         this call, so a withdraw-and-redeposit cannot swap terms under a pending `take`.
     function withdraw(uint256 tokenId) external nonReentrant {
         Seat storage s = _onlyOwner(tokenId);
         if (s.operator != address(0)) revert SeatNotVacant(tokenId);
+        SeatHolder holder = _holders[tokenId];
         delete _seats[tokenId];
+        // forge-lint: disable-next-line(unsafe-typecast)
+        _seats[tokenId].termsActiveAt = uint64(block.timestamp + TERMS_DELAY);
         emit SeatWithdrawn(tokenId, msg.sender);
-        seatNFT.safeTransferFrom(address(this), msg.sender, tokenId);
+        holder.releaseNft(msg.sender);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -381,69 +444,82 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
         emit Credited(tokenId, token, msg.sender, received);
     }
 
-    /// @notice Call a reward distributor on behalf of a seat you deposited and book what arrives in `tokens`.
-    /// @dev `target` may not be the seat NFT, the bond token, this contract, an address without code, a token that
-    ///      has booked balances, or any contract that answers `balanceOf(address(this))`: the registry is
-    ///      `msg.sender` of the call, so it must never call a token it could ever hold (an `approve` would outlive
-    ///      the call and drain balances booked to other seats later). `tokens` may not name the seat NFT; a token
-    ///      listed more than once is measured and booked once. The call carries no value. Afterwards this contract
-    ///      must still hold the seat and the balance of every listed token must not have decreased. ETH is always
-    ///      measured, whether or not `address(0)` is listed, because `receive` only opens during this call and
-    ///      nothing that arrives may stay unattributed.
+    /// @notice Call a reward distributor as the wallet of a seat you deposited and book what arrives in `tokens`.
+    /// @dev The seat's holder makes the call, so the target can reach nothing but that seat's own wallet. `target`
+    ///      may not be the seat NFT, the bond token, this contract, the holder, an address without code, a token that
+    ///      has booked balances, or any contract that answers `balanceOf(address(this))`: the holder is `msg.sender`
+    ///      of the call, so it must never call a token it could hold (an `approve` would outlive the call and let the
+    ///      owner drain rewards before they are booked). `tokens` may not name the seat NFT; a token listed more
+    ///      than once is collected once. The call carries no value. Afterwards the holder must still own the seat
+    ///      and its balance of every listed token must not have decreased. The holder's whole balance of each
+    ///      listed token, and all of its ETH whether or not `address(0)` is listed, is then moved here and booked.
+    ///      Anything the holder receives in a token that was not listed can be booked later with `skim`.
     function claim(uint256 tokenId, address target, bytes calldata data, address[] calldata tokens)
         external
         nonReentrant
     {
         _onlyOwner(tokenId);
+        SeatHolder holder = _holders[tokenId];
         if (
             target == address(seatNFT) || target == address(bondToken) || target == address(this)
-                || target.code.length == 0 || totalCredited[target] != 0 || _answersBalanceOf(target)
+                || target == address(holder) || target.code.length == 0 || totalCredited[target] != 0
+                || _answersBalanceOf(target)
         ) revert ForbiddenTarget(target);
 
-        uint256 ethBefore = address(this).balance;
         uint256[] memory before = new uint256[](tokens.length);
         for (uint256 i; i < tokens.length; ++i) {
             if (tokens[i] == address(seatNFT)) revert ForbiddenToken(tokens[i]);
-            before[i] = _balanceOf(tokens[i]);
+            before[i] = _balanceOf(address(holder), tokens[i]);
         }
 
-        _claimActive = true;
-        (bool ok, bytes memory reason) = target.call(data);
-        _claimActive = false;
+        (bool ok, bytes memory reason) = holder.execute(target, data);
         if (!ok) revert ClaimFailed(reason);
         emit Claimed(tokenId, target, data);
 
-        if (seatNFT.ownerOf(tokenId) != address(this)) revert NftNotHeld(tokenId);
+        if (seatNFT.ownerOf(tokenId) != address(holder)) revert NftNotHeld(tokenId);
         for (uint256 i; i < tokens.length; ++i) {
             if (tokens[i] == address(0) || _listedBefore(tokens, i)) continue;
-            uint256 afterwards = _balanceOf(tokens[i]);
-            if (afterwards < before[i]) revert BookedBalanceDecreased(tokens[i], before[i], afterwards);
-            uint256 gained = afterwards - before[i];
-            if (gained != 0) _book(tokenId, tokens[i], gained);
+            uint256 afterwards = _balanceOf(address(holder), tokens[i]);
+            if (afterwards < before[i]) revert HolderBalanceDecreased(tokens[i], before[i], afterwards);
+            _collect(tokenId, holder, tokens[i]);
         }
-        uint256 ethGained = address(this).balance - ethBefore;
-        if (ethGained != 0) _book(tokenId, address(0), ethGained);
+        _collect(tokenId, holder, address(0));
     }
 
-    /// @notice Pay out a seat's booked balance of `token` to its owner and operator by `ownerBps`.
-    ///         A vacant seat pays everything to the owner. Anyone may call.
+    /// @notice Book whatever a seat's holder holds of `token` (address(0) = ETH). Anyone may call. This is how
+    ///         rewards that reach the wallet outside `claim` (a distributor claimed by a third party, a token that
+    ///         was not listed, ETH sent to the holder) are attributed to the seat.
+    function skim(uint256 tokenId, address token) external nonReentrant {
+        if (_seats[tokenId].owner == address(0)) revert SeatNotDeposited(tokenId);
+        if (token == address(seatNFT)) revert ForbiddenToken(token);
+        uint256 received = _collect(tokenId, _holders[tokenId], token);
+        if (received == 0) revert ZeroAmount();
+        emit Skimmed(tokenId, token, received);
+    }
+
+    /// @notice Pay out what a seat's owner and current operator are owed in `token`. Anyone may call. Shares were
+    ///         split by `ownerBps` when they were booked (all to the owner while vacant), so who holds the seat now
+    ///         changes nothing about balances booked earlier. A share whose push fails stays booked to its account.
     function sweep(uint256 tokenId, address token) external nonReentrant {
         Seat storage s = _seats[tokenId];
         address owner = s.owner;
         if (owner == address(0)) revert SeatNotDeposited(tokenId);
-        uint256 amount = _credited[tokenId][token];
-        if (amount == 0) revert ZeroAmount();
-
-        _credited[tokenId][token] = 0;
-        totalCredited[token] -= amount;
-
         address operator = s.operator;
-        uint256 ownerAmount = operator == address(0) ? amount : (amount * s.ownerBps) / BPS;
-        uint256 operatorAmount = amount - ownerAmount;
-        emit Swept(tokenId, token, owner, ownerAmount, operator, operatorAmount);
+        uint256 ownerAmount = _shares[tokenId][token][owner];
+        uint256 operatorAmount = operator == address(0) || operator == owner ? 0 : _shares[tokenId][token][operator];
+        if (ownerAmount + operatorAmount == 0) revert ZeroAmount();
 
-        _pay(token, owner, ownerAmount);
-        _pay(token, operator, operatorAmount);
+        emit Swept(tokenId, token, owner, ownerAmount, operator, operatorAmount);
+        _payShare(tokenId, token, owner, ownerAmount);
+        _payShare(tokenId, token, operator, operatorAmount);
+    }
+
+    /// @notice Pay `account` the share of a seat's `token` balance that was booked to it, whether or not it still
+    ///         owns or operates the seat and whether or not the seat is still deposited. Anyone may call.
+    function sweepFor(uint256 tokenId, address token, address account) external nonReentrant {
+        uint256 amount = _shares[tokenId][token][account];
+        if (amount == 0) revert ZeroAmount();
+        _payShare(tokenId, token, account, amount);
     }
 
     /// @notice Collect a bond that could not be pushed to you when your seat was cleared.
@@ -459,29 +535,26 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
     // ERC-1271
     // ---------------------------------------------------------------------------------------------
 
-    /// @notice ERC-1271 check used by the network when pairing a device to a leased seat.
+    /// @notice ERC-1271 check used by the network when pairing a device to a leased seat. The seat's holder answers
+    ///         the same question for the network by calling `isValidSignatureFor`.
     /// @param hash The EIP-712 digest of the WorkerAuthorization under the network domain.
     /// @param signature `abi.encode(deviceKey, wallet, tokenId, nonce, expiresAt, relayOrigin, operatorSignature)`.
-    /// @return `0x1626ba7e` when the encoded authorization hashes to `hash`, names this contract as wallet, its seat
-    ///         has an operator, that operator signed `hash`, and the authorization has not expired. `0xffffffff`
-    ///         otherwise, including for malformed bytes.
+    /// @return `0x1626ba7e` when the encoded authorization hashes to `hash`, names the seat's holder as wallet, the
+    ///         seat has an operator, that operator signed `hash`, and the authorization has not expired.
+    ///         `0xffffffff` otherwise, including for malformed bytes.
     function isValidSignature(bytes32 hash, bytes calldata signature) external view override returns (bytes4) {
-        WorkerAuthorization memory auth;
-        bytes memory operatorSignature;
-        try this.decodeAuthorization(signature) returns (WorkerAuthorization memory a, bytes memory sig) {
-            auth = a;
-            operatorSignature = sig;
-        } catch {
-            return FAIL_VALUE;
-        }
-        if (auth.wallet != address(this)) return FAIL_VALUE;
-        if (hashWorkerAuthorization(auth) != hash) return FAIL_VALUE;
-        if (auth.expiresAt <= block.timestamp) return FAIL_VALUE;
-        address operator = _seats[auth.tokenId].operator;
-        if (operator == address(0)) return FAIL_VALUE;
-        (address recovered, ECDSA.RecoverError err,) = ECDSA.tryRecover(hash, operatorSignature);
-        if (err != ECDSA.RecoverError.NoError || recovered != operator) return FAIL_VALUE;
-        return MAGIC_VALUE;
+        return _isValid(hash, signature, address(0));
+    }
+
+    /// @notice Same as `isValidSignature`, additionally requiring the authorization's wallet to be `wallet`.
+    ///         Holders call this with their own address so an authorization for another seat never validates
+    ///         through them.
+    function isValidSignatureFor(address wallet, bytes32 hash, bytes calldata signature)
+        external
+        view
+        returns (bytes4)
+    {
+        return _isValid(hash, signature, wallet);
     }
 
     /// @notice Split an ERC-1271 signature blob into its authorization and the operator's signature.
@@ -511,14 +584,29 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
         return _seats[tokenId];
     }
 
-    /// @notice Booked, not yet swept, balance of `token` for a seat.
+    /// @notice The wallet that holds a seat and receives its rewards; zero until the token id is first deposited.
+    function holderOf(uint256 tokenId) external view returns (address) {
+        return address(_holders[tokenId]);
+    }
+
+    /// @notice Booked, not yet swept, balance of `token` for a seat: the sum of every account's share.
     function credited(uint256 tokenId, address token) external view returns (uint256) {
         return _credited[tokenId][token];
+    }
+
+    /// @notice What `account` is owed out of a seat's booked balance of `token`.
+    function share(uint256 tokenId, address token, address account) external view returns (uint256) {
+        return _shares[tokenId][token][account];
     }
 
     /// @notice Whether an oracle request id has already been consumed by `cutByOracle`.
     function usedRequest(bytes32 requestId) external view returns (bool) {
         return _usedRequests[requestId];
+    }
+
+    /// @notice True while `deposit` is moving `tokenId` into its holder; the holder accepts the NFT only then.
+    function depositInFlight(uint256 tokenId) external view returns (bool) {
+        return _depositActive && _depositing == tokenId;
     }
 
     /// @notice The network's WorkerAuthorization domain: name, version, chain id, verifying contract (the seat NFT).
@@ -581,18 +669,6 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
     }
 
     // ---------------------------------------------------------------------------------------------
-    // ERC-721 receiver
-    // ---------------------------------------------------------------------------------------------
-
-    /// @dev Accepts only the seat NFT, and only the token whose deposit is in flight.
-    function onERC721Received(address, address, uint256 tokenId, bytes memory) public view override returns (bytes4) {
-        if (!_depositActive || msg.sender != address(seatNFT) || tokenId != _depositing) {
-            revert UnexpectedToken(msg.sender, tokenId);
-        }
-        return this.onERC721Received.selector;
-    }
-
-    // ---------------------------------------------------------------------------------------------
     // Internals
     // ---------------------------------------------------------------------------------------------
 
@@ -611,7 +687,8 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
         uint256 bondAmount,
         address oracleSigner,
         bytes32 questionHash,
-        string calldata listing
+        string calldata listing,
+        uint64 activeAt
     ) private {
         if (ownerBps > BPS) revert InvalidBps(ownerBps);
         if (bytes(listing).length > MAX_LISTING_BYTES) revert ListingTooLong(bytes(listing).length);
@@ -622,26 +699,82 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
         s.oracleSigner = oracleSigner;
         s.questionHash = questionHash;
         s.listing = listing;
-        emit TermsSet(tokenId, ownerBps, mode, allowedOperator, bondAmount, oracleSigner, questionHash, listing);
+        s.termsActiveAt = activeAt;
+        emit TermsSet(
+            tokenId, ownerBps, mode, allowedOperator, bondAmount, oracleSigner, questionHash, listing, activeAt
+        );
     }
 
     function _clearOperator(Seat storage s) private returns (uint256 held) {
         held = s.bondHeld;
         s.operator = address(0);
         s.bondHeld = 0;
+        s.takenAt = 0;
+        s.takenBlock = 0;
     }
 
+    /// @dev Books `amount` to the seat and splits it between the owner and the operator seated right now by
+    ///      `ownerBps`; a vacant seat books everything to the owner. The split is final: later takes, quits and
+    ///      cuts only affect amounts booked after them.
     function _book(uint256 tokenId, address token, uint256 amount) private {
+        Seat storage s = _seats[tokenId];
+        address operator = s.operator;
+        uint256 ownerPart = operator == address(0) ? amount : (amount * s.ownerBps) / BPS;
+        uint256 operatorPart = amount - ownerPart;
         _credited[tokenId][token] += amount;
         totalCredited[token] += amount;
         emit Booked(tokenId, token, amount);
+        if (ownerPart != 0) {
+            _shares[tokenId][token][s.owner] += ownerPart;
+            emit ShareAccrued(tokenId, token, s.owner, ownerPart);
+        }
+        if (operatorPart != 0) {
+            _shares[tokenId][token][operator] += operatorPart;
+            emit ShareAccrued(tokenId, token, operator, operatorPart);
+        }
     }
 
-    function _balanceOf(address token) private view returns (uint256) {
-        return token == address(0) ? address(this).balance : IERC20(token).balanceOf(address(this));
+    /// @dev Moves the holder's whole balance of `token` to the registry and books what arrives.
+    function _collect(uint256 tokenId, SeatHolder holder, address token) private returns (uint256 received) {
+        uint256 amount = _balanceOf(address(holder), token);
+        if (amount == 0) return 0;
+        uint256 before = _balanceOf(address(this), token);
+        // The balance is re-read after the holder's transfer on purpose: only what actually arrived is booked
+        // (fee-on-transfer tokens), and every caller of `_collect` is `nonReentrant`.
+        if (token == address(0)) {
+            _collecting = true;
+            // forge-lint: disable-next-line(reentrancy-balance)
+            holder.release(token, amount);
+            _collecting = false;
+        } else {
+            // forge-lint: disable-next-line(reentrancy-balance)
+            holder.release(token, amount);
+        }
+        received = _balanceOf(address(this), token) - before;
+        if (received != 0) _book(tokenId, token, received);
     }
 
-    /// @dev True when `tokens[i]` already appears at a lower index, so a repeated entry is booked only once.
+    /// @dev Pays `account` its share; on a failed push the share stays booked so nobody else's payout is blocked.
+    function _payShare(uint256 tokenId, address token, address account, uint256 amount) private {
+        if (amount == 0) return;
+        _shares[tokenId][token][account] = 0;
+        _credited[tokenId][token] -= amount;
+        totalCredited[token] -= amount;
+        if (_tryPay(token, account, amount)) {
+            emit SharePaid(tokenId, token, account, amount);
+        } else {
+            _shares[tokenId][token][account] = amount;
+            _credited[tokenId][token] += amount;
+            totalCredited[token] += amount;
+            emit ShareRetained(tokenId, token, account, amount);
+        }
+    }
+
+    function _balanceOf(address account, address token) private view returns (uint256) {
+        return token == address(0) ? account.balance : IERC20(token).balanceOf(account);
+    }
+
+    /// @dev True when `tokens[i]` already appears at a lower index, so a repeated entry is collected only once.
     function _listedBefore(address[] calldata tokens, uint256 i) private pure returns (bool) {
         for (uint256 j; j < i; ++j) {
             if (tokens[j] == tokens[i]) return true;
@@ -649,8 +782,8 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
         return false;
     }
 
-    /// @dev True when `target` answers `balanceOf(address(this))` with a word, i.e. it is a token whose balance the
-    ///      registry could book. Such a contract is never a valid `claim` target.
+    /// @dev True when `target` answers `balanceOf(address(this))` with a word, i.e. it is a token whose balance a
+    ///      holder could hold. Such a contract is never a valid `claim` target.
     function _answersBalanceOf(address target) private view returns (bool) {
         (bool ok, bytes memory ret) = target.staticcall(abi.encodeCall(IERC20.balanceOf, (address(this))));
         return ok && ret.length >= 32;
@@ -660,24 +793,49 @@ contract SeatLease is ERC721Holder, IERC1271, EIP712, ReentrancyGuard {
     ///      amount is escrowed for `redeemBond` so the seat is never stuck occupied.
     function _payBond(address to, uint256 amount) private {
         if (amount == 0) return;
-        (bool ok, bytes memory ret) = address(bondToken).call(abi.encodeCall(IERC20.transfer, (to, amount)));
-        bool success = ok
-            && (ret.length == 0
-                    ? address(bondToken).code.length != 0
-                    : (ret.length >= 32 && abi.decode(ret, (uint256)) == 1));
-        if (!success) {
+        if (!_tryTransferToken(address(bondToken), to, amount)) {
             bondOwed[to] += amount;
             emit BondEscrowed(to, amount);
         }
     }
 
-    function _pay(address token, address to, uint256 amount) private {
-        if (amount == 0) return;
+    /// @dev Pushes ETH with a bounded gas stipend, or an ERC-20 through `_tryTransferToken`. Never reverts.
+    ///      The ETH push copies no return data, so a recipient can neither revert the sweep nor bloat it.
+    function _tryPay(address token, address to, uint256 amount) private returns (bool ok) {
         if (token == address(0)) {
-            (bool ok,) = to.call{value: amount}("");
-            if (!ok) revert EthTransferFailed(to, amount);
-        } else {
-            IERC20(token).safeTransfer(to, amount);
+            uint256 stipend = SWEEP_ETH_GAS;
+            assembly ("memory-safe") {
+                ok := call(stipend, to, amount, 0, 0, 0, 0)
+            }
+            return ok;
         }
+        return _tryTransferToken(token, to, amount);
+    }
+
+    /// @dev ERC-20 `transfer` that reports failure instead of reverting: a revert, a `false` return or a malformed
+    ///      return all count as failure; empty return data counts as success only when the token has code.
+    function _tryTransferToken(address token, address to, uint256 amount) private returns (bool) {
+        (bool ok, bytes memory ret) = token.call(abi.encodeCall(IERC20.transfer, (to, amount)));
+        return ok && (ret.length == 0 ? token.code.length != 0 : (ret.length >= 32 && abi.decode(ret, (uint256)) == 1));
+    }
+
+    function _isValid(bytes32 hash, bytes calldata signature, address wallet) private view returns (bytes4) {
+        WorkerAuthorization memory auth;
+        bytes memory operatorSignature;
+        try this.decodeAuthorization(signature) returns (WorkerAuthorization memory a, bytes memory sig) {
+            auth = a;
+            operatorSignature = sig;
+        } catch {
+            return FAIL_VALUE;
+        }
+        if (wallet != address(0) && auth.wallet != wallet) return FAIL_VALUE;
+        if (auth.wallet != address(_holders[auth.tokenId])) return FAIL_VALUE;
+        if (hashWorkerAuthorization(auth) != hash) return FAIL_VALUE;
+        if (auth.expiresAt <= block.timestamp) return FAIL_VALUE;
+        address operator = _seats[auth.tokenId].operator;
+        if (operator == address(0)) return FAIL_VALUE;
+        (address recovered, ECDSA.RecoverError err,) = ECDSA.tryRecover(hash, operatorSignature);
+        if (err != ECDSA.RecoverError.NoError || recovered != operator) return FAIL_VALUE;
+        return MAGIC_VALUE;
     }
 }

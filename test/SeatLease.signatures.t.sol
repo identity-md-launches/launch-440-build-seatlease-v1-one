@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import {Base} from "./utils/Base.sol";
 import {SeatLease} from "../src/SeatLease.sol";
+import {SeatHolder} from "../src/SeatHolder.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 /// @dev ERC-1271 pairing signatures and oracle-attested cuts.
@@ -32,6 +33,54 @@ contract SeatLeaseSignaturesTest is Base {
         assertEq(lease.isValidSignature(digest, blob), MAGIC);
         // The contract's own digest helper agrees with the independent computation.
         assertEq(lease.hashWorkerAuthorization(_auth(TOKEN_ID, expiry)), digest);
+        // The authorization names the seat's wallet, which is the NFT's owner as the network sees it.
+        assertEq(_auth(TOKEN_ID, expiry).wallet, nft.ownerOf(TOKEN_ID));
+    }
+
+    /// @dev The network calls the NFT owner, i.e. the seat's holder; it defers to the registry for its own wallet.
+    function test_isValidSignature_holderAnswersForItsSeat() public {
+        (bytes32 digest, bytes memory blob) = _validBlob();
+        SeatHolder holder = SeatHolder(payable(_holder()));
+        assertEq(holder.isValidSignature(digest, blob), MAGIC);
+        assertEq(lease.isValidSignatureFor(address(holder), digest, blob), MAGIC);
+        assertEq(lease.isValidSignatureFor(address(0), digest, blob), MAGIC);
+
+        // Another seat's holder never validates seat 7's authorization, even though it is valid for seat 7.
+        nft.mint(owner, 8);
+        vm.startPrank(owner);
+        nft.approve(address(lease), 8);
+        lease.deposit(8, 5000, SeatLease.Mode.Permissioned, stranger, 0, address(0), bytes32(0), "");
+        vm.stopPrank();
+        SeatHolder holder8 = SeatHolder(payable(lease.holderOf(8)));
+        assertEq(holder8.isValidSignature(digest, blob), FAIL);
+        assertEq(lease.isValidSignatureFor(address(holder8), digest, blob), FAIL);
+        assertEq(lease.isValidSignatureFor(owner, digest, blob), FAIL);
+
+        // Invalid for the registry stays invalid for the holder.
+        vm.prank(operator);
+        lease.quit(TOKEN_ID);
+        assertEq(holder.isValidSignature(digest, blob), FAIL);
+    }
+
+    function test_isValidSignature_rejectsRegistryAsWallet() public view {
+        // The registry never owns a seat, so an authorization naming it as wallet is never valid.
+        SeatLease.WorkerAuthorization memory a = _auth(TOKEN_ID, expiry);
+        a.wallet = address(lease);
+        bytes32 digest = _workerDigest(a);
+        assertEq(lease.isValidSignature(digest, _encode1271(a, _sign(operatorKey, digest))), FAIL);
+        assertEq(lease.isValidSignatureFor(address(lease), digest, _encode1271(a, _sign(operatorKey, digest))), FAIL);
+    }
+
+    function test_isValidSignature_rejectsAnotherSeatsHolderAsWallet() public {
+        nft.mint(owner, 8);
+        vm.startPrank(owner);
+        nft.approve(address(lease), 8);
+        lease.deposit(8, 5000, SeatLease.Mode.Permissioned, stranger, 0, address(0), bytes32(0), "");
+        vm.stopPrank();
+        SeatLease.WorkerAuthorization memory a = _auth(TOKEN_ID, expiry);
+        a.wallet = lease.holderOf(8);
+        bytes32 digest = _workerDigest(a);
+        assertEq(lease.isValidSignature(digest, _encode1271(a, _sign(operatorKey, digest))), FAIL);
     }
 
     function test_isValidSignature_domainMatchesNetworkParameters() public view {
@@ -391,6 +440,7 @@ contract SeatLeaseSignaturesTest is Base {
         lease.quit(TOKEN_ID);
         vm.prank(owner);
         lease.setTerms(TOKEN_ID, 5000, SeatLease.Mode.Open, address(0), BOND_AMOUNT, address(0), QUESTION, "");
+        _activateTerms();
         _takeOpen();
         SeatLease.OracleAttestation memory att = _goodAttestation(keccak256("req"));
         vm.expectRevert(abi.encodeWithSelector(SeatLease.NoOracle.selector, TOKEN_ID));
@@ -413,12 +463,103 @@ contract SeatLeaseSignaturesTest is Base {
         lease.quit(TOKEN_ID);
         vm.prank(owner);
         lease.setTerms(TOKEN_ID, 5000, SeatLease.Mode.Permissioned, operator, 0, oracle, QUESTION, "");
+        _activateTerms();
         _takePermissioned();
         SeatLease.OracleAttestation memory att = _goodAttestation(keccak256("req"));
         vm.expectEmit(address(lease));
         emit SeatLease.SeatCutByOracle(TOKEN_ID, operator, att.requestId, 0);
         lease.cutByOracle(TOKEN_ID, att, _signAttestation(oracleKey, att));
         assertEq(bond.balanceOf(owner), 0);
+    }
+
+    // ---------------------------------------------------------- tenure binding (finding ecb32761)
+
+    /// @dev Regression for finding ecb32761: an attestation issued before the current operator took the seat is
+    ///      refused, so a true attestation about a previous operator can never forfeit the next operator's bond.
+    function test_cutByOracle_rejectsAttestationIssuedBeforeCurrentTenure() public {
+        SeatLease.OracleAttestation memory att = _goodAttestation(keccak256("req-about-previous-operator"));
+        bytes memory sig = _signAttestation(oracleKey, att);
+        vm.prank(operator);
+        lease.quit(TOKEN_ID);
+        assertEq(bond.balanceOf(operator), 10 * BOND_AMOUNT);
+
+        vm.warp(vm.getBlockTimestamp() + 30 minutes);
+        vm.roll(vm.getBlockNumber() + 300);
+        vm.startPrank(stranger);
+        bond.approve(address(lease), BOND_AMOUNT);
+        lease.take(TOKEN_ID);
+        vm.stopPrank();
+        uint64 takenAt = lease.seat(TOKEN_ID).takenAt;
+        assertEq(takenAt, uint64(block.timestamp));
+
+        vm.prank(owner);
+        vm.expectRevert(
+            abi.encodeWithSelector(SeatLease.OracleAttestationPredatesTenure.selector, att.issuedAt, takenAt)
+        );
+        lease.cutByOracle(TOKEN_ID, att, sig);
+        assertEq(lease.seat(TOKEN_ID).operator, stranger);
+        assertEq(lease.seat(TOKEN_ID).bondHeld, BOND_AMOUNT);
+        assertEq(bond.balanceOf(owner) + lease.bondOwed(owner), 0);
+        assertFalse(lease.usedRequest(att.requestId));
+    }
+
+    function test_cutByOracle_rejectsObservationWindowStartingBeforeCurrentTenure() public {
+        vm.roll(vm.getBlockNumber() + 100);
+        vm.prank(operator);
+        lease.quit(TOKEN_ID);
+        vm.warp(vm.getBlockTimestamp() + 1);
+        vm.roll(vm.getBlockNumber() + 10);
+        _takeOpen();
+        uint64 takenBlock = lease.seat(TOKEN_ID).takenBlock;
+        assertEq(takenBlock, uint64(block.number));
+
+        // Issued now, but its evidence window starts before this operator existed.
+        SeatLease.OracleAttestation memory att = _goodAttestation(keccak256("req"));
+        att.fromBlock = takenBlock - 1;
+        vm.expectRevert(
+            abi.encodeWithSelector(SeatLease.OracleWindowPredatesTenure.selector, takenBlock - 1, takenBlock)
+        );
+        lease.cutByOracle(TOKEN_ID, att, _signAttestation(oracleKey, att));
+
+        // A window starting at the take block is accepted.
+        att.fromBlock = takenBlock;
+        lease.cutByOracle(TOKEN_ID, att, _signAttestation(oracleKey, att));
+        assertEq(lease.seat(TOKEN_ID).operator, address(0));
+    }
+
+    function test_cutByOracle_acceptsAttestationIssuedAtTakeTime() public {
+        // Attestation issued in the same second the operator took the seat: not before the tenure, so accepted.
+        SeatLease.OracleAttestation memory att = _goodAttestation(keccak256("req"));
+        assertEq(att.issuedAt, lease.seat(TOKEN_ID).takenAt);
+        lease.cutByOracle(TOKEN_ID, att, _signAttestation(oracleKey, att));
+        assertEq(bond.balanceOf(owner), BOND_AMOUNT);
+    }
+
+    function test_cutByOracle_ownerCannotRecycleAttestationAgainstNextOperator() public {
+        // The forfeiture beneficiary takes its own seat, gets a true attestation, quits, and waits for a victim.
+        vm.prank(operator);
+        lease.quit(TOKEN_ID);
+        bond.mint(owner, BOND_AMOUNT);
+        vm.startPrank(owner);
+        bond.approve(address(lease), BOND_AMOUNT);
+        lease.take(TOKEN_ID);
+        vm.stopPrank();
+        SeatLease.OracleAttestation memory att = _goodAttestation(keccak256("req-about-owner"));
+        bytes memory sig = _signAttestation(oracleKey, att);
+        vm.prank(owner);
+        lease.quit(TOKEN_ID);
+
+        vm.warp(vm.getBlockTimestamp() + 10 minutes);
+        vm.roll(vm.getBlockNumber() + 50);
+        _takeOpen();
+        vm.prank(owner);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                SeatLease.OracleAttestationPredatesTenure.selector, att.issuedAt, lease.seat(TOKEN_ID).takenAt
+            )
+        );
+        lease.cutByOracle(TOKEN_ID, att, sig);
+        assertEq(lease.seat(TOKEN_ID).operator, operator);
     }
 
     function testFuzz_cutByOracle_onlyOracleKeyPasses(uint256 key) public {

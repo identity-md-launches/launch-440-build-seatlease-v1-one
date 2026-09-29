@@ -1,0 +1,64 @@
+{
+  "chainId": 31337,
+  "network": "anvil (local)",
+  "deployer": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+  "script": "script/Deploy.s.sol",
+  "command": "DEPLOY_MOCKS=true PRIVATE_KEY=<anvil key 0> forge script script/Deploy.s.sol --rpc-url http://127.0.0.1:8545 --broadcast",
+  "constructorArgs": {
+    "seatNFT": "$MockSeatNFT",
+    "bondToken": "$MockERC20",
+    "workerDomainName": "IdentityMD Worker",
+    "workerDomainVersion": "2"
+  },
+  "contracts": [
+    {
+      "name": "MockSeatNFT",
+      "address": "0x5fbdb2315678afecb367f032d93f642f64180aa3",
+      "txHash": "0xd475fc0188083cb9ff9d3d0112a8003279d10d3c7e813df8ae8ab06ee80476b5",
+      "block": 1,
+      "gasUsed": 936241
+    },
+    {
+      "name": "MockERC20",
+      "address": "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512",
+      "txHash": "0x6734c5e65e6f5819815e4fe76b7a1ed00d06c94cd9826f41c07ef4ca397c22e9",
+      "block": 1,
+      "gasUsed": 501274
+    },
+    {
+      "name": "SeatLease",
+      "address": "0x9fe46736679d2d9a65f0992f2272de9f3c7fa6e0",
+      "txHash": "0x43c2c6d640b835c6c802137d3d368ffb011f2b047b0cea58e87b6c62779f526c",
+      "block": 1,
+      "gasUsed": 4968476
+    }
+  ],
+  "exampleSeat": {
+    "tokenId": 1,
+    "owner": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+    "operator": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+    "holder": "0xE4D7Ed540075309fB4151D724ac3c6CBF2da6FB9",
+    "transactions": [
+      {
+        "step": "MockSeatNFT.mint(owner, 1)",
+        "txHash": "0x54e5092112c0eadf8b114c36afad8515703ae2526a4871388e64ab9b06f327ce",
+        "block": 6
+      },
+      {
+        "step": "MockSeatNFT.approve(SeatLease, 1)",
+        "txHash": "0x84de87305e66829e7141479320c5780ae28858a03592057025272d2ba9070058",
+        "block": 7
+      },
+      {
+        "step": "SeatLease.deposit(1, 5000, Permissioned, operator, 0, 0x0, 0x0, 'example seat')",
+        "txHash": "0x379609df2fdb559c3d9fe69c8ab5529963d2ac7d52706ce538409cd0707a8459",
+        "block": 8
+      },
+      {
+        "step": "SeatLease.take(1) by operator",
+        "txHash": "0x01ce3ef1b78b8f65545a271a72aad80cc2e57da06271284274e0c7c3d2e9b5f9",
+        "block": 9
+      }
+    ]
+  }
+}

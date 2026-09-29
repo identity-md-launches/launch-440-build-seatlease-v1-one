@@ -3,10 +3,19 @@ pragma solidity ^0.8.26;
 
 import {Base} from "./utils/Base.sol";
 import {SeatLease} from "../src/SeatLease.sol";
+import {SeatHolder} from "../src/SeatHolder.sol";
 import {MockSeatNFT} from "../src/mocks/MockSeatNFT.sol";
-import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
+import {IERC20Errors, IERC721Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import {FeeOnTransferToken, TunableToken, ReentrantBondToken, EvilNFT, EthRejecter} from "./utils/Actors.sol";
+import {
+    FeeOnTransferToken,
+    TunableToken,
+    ReentrantBondToken,
+    EvilNFT,
+    EthRejecter,
+    PlainWallet,
+    HolderDriver
+} from "./utils/Actors.sol";
 
 /// @dev deposit / setTerms / take / quit / cut / withdraw, both modes, bond return and escrow.
 contract SeatLeaseLifecycleTest is Base {
@@ -22,6 +31,8 @@ contract SeatLeaseLifecycleTest is Base {
         assertEq(verifying, address(nft));
         assertEq(lease.BPS(), 10_000);
         assertEq(lease.MAX_LISTING_BYTES(), 280);
+        assertEq(lease.TERMS_DELAY(), 1 hours);
+        assertEq(lease.holderOf(TOKEN_ID), address(0));
     }
 
     function test_constructor_rejectsZeroAddresses() public {
@@ -44,11 +55,21 @@ contract SeatLeaseLifecycleTest is Base {
     function test_deposit_recordsOwnerTermsAndHoldsNft() public {
         vm.startPrank(owner);
         nft.approve(address(lease), TOKEN_ID);
+        vm.expectEmit(true, false, false, false, address(lease));
+        emit SeatLease.HolderCreated(TOKEN_ID, address(0));
         vm.expectEmit(address(lease));
         emit SeatLease.SeatDeposited(TOKEN_ID, owner);
         vm.expectEmit(address(lease));
         emit SeatLease.TermsSet(
-            TOKEN_ID, 5000, SeatLease.Mode.Open, address(0), BOND_AMOUNT, oracle, QUESTION, "seat 7 for lease"
+            TOKEN_ID,
+            5000,
+            SeatLease.Mode.Open,
+            address(0),
+            BOND_AMOUNT,
+            oracle,
+            QUESTION,
+            "seat 7 for lease",
+            uint64(block.timestamp)
         );
         lease.deposit(
             TOKEN_ID, 5000, SeatLease.Mode.Open, address(0), BOND_AMOUNT, oracle, QUESTION, "seat 7 for lease"
@@ -66,7 +87,48 @@ contract SeatLeaseLifecycleTest is Base {
         assertEq(s.oracleSigner, oracle);
         assertEq(s.questionHash, QUESTION);
         assertEq(s.listing, "seat 7 for lease");
-        assertEq(nft.ownerOf(TOKEN_ID), address(lease));
+        // Terms recorded at deposit are live at once.
+        assertEq(s.termsActiveAt, uint64(block.timestamp));
+        assertEq(s.takenAt, 0);
+        assertEq(s.takenBlock, 0);
+
+        // The seat sits in its own holder, a contract the registry created for this token id.
+        address holder = _holder();
+        assertTrue(holder != address(0) && holder != address(lease));
+        assertGt(holder.code.length, 0);
+        assertEq(nft.ownerOf(TOKEN_ID), holder);
+        assertEq(address(SeatHolder(payable(holder)).registry()), address(lease));
+        assertEq(address(SeatHolder(payable(holder)).seatNFT()), address(nft));
+        assertEq(SeatHolder(payable(holder)).tokenId(), TOKEN_ID);
+    }
+
+    function test_deposit_holderIsDeterministicAndReused() public {
+        _depositOpen(5000);
+        address holder = _holder();
+        bytes32 initHash = keccak256(abi.encodePacked(type(SeatHolder).creationCode, abi.encode(nft, TOKEN_ID)));
+        address predicted = address(
+            uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(lease), bytes32(TOKEN_ID), initHash))))
+        );
+        assertEq(holder, predicted);
+
+        vm.prank(owner);
+        lease.withdraw(TOKEN_ID);
+        assertEq(lease.holderOf(TOKEN_ID), holder, "holder survives withdraw");
+        vm.startPrank(owner);
+        nft.approve(address(lease), TOKEN_ID);
+        lease.deposit(TOKEN_ID, 1, SeatLease.Mode.Open, address(0), 0, address(0), bytes32(0), "");
+        vm.stopPrank();
+        assertEq(lease.holderOf(TOKEN_ID), holder, "same holder on redeposit");
+        assertEq(nft.ownerOf(TOKEN_ID), holder);
+
+        // Another token id gets its own holder.
+        nft.mint(owner, 8);
+        vm.startPrank(owner);
+        nft.approve(address(lease), 8);
+        lease.deposit(8, 1, SeatLease.Mode.Open, address(0), 0, address(0), bytes32(0), "");
+        vm.stopPrank();
+        assertTrue(lease.holderOf(8) != holder);
+        assertEq(nft.ownerOf(8), lease.holderOf(8));
     }
 
     function test_deposit_revertsWhenCallerDoesNotOwnNft() public {
@@ -115,31 +177,82 @@ contract SeatLeaseLifecycleTest is Base {
         assertEq(bytes(lease.seat(TOKEN_ID).listing).length, 280);
     }
 
-    function test_onERC721Received_rejectsDirectTransferOfSeatNft() public {
+    function test_onERC721Received_registryRefusesEveryNft() public {
+        // The registry has no receiver hook at all: a safe transfer to it reverts inside the NFT.
         vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(SeatLease.UnexpectedToken.selector, address(nft), TOKEN_ID));
+        vm.expectRevert(abi.encodeWithSelector(IERC721Errors.ERC721InvalidReceiver.selector, address(lease)));
         nft.safeTransferFrom(owner, address(lease), TOKEN_ID);
         assertEq(nft.ownerOf(TOKEN_ID), owner);
     }
 
-    function test_onERC721Received_rejectsOtherCollections() public {
-        MockSeatNFT other = new MockSeatNFT();
-        other.mint(owner, 1);
+    function test_onERC721Received_holderRejectsDirectTransferOfSeatNft() public {
+        _depositOpen(5000);
         vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(SeatLease.UnexpectedToken.selector, address(other), 1));
-        other.safeTransferFrom(owner, address(lease), 1);
+        lease.withdraw(TOKEN_ID);
+        address holder = _holder();
+        // Outside of a deposit the holder refuses even its own token id.
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(SeatHolder.UnexpectedToken.selector, address(nft), TOKEN_ID));
+        nft.safeTransferFrom(owner, holder, TOKEN_ID);
+        assertEq(nft.ownerOf(TOKEN_ID), owner);
+        // And never another token id of the seat collection.
+        nft.mint(owner, 8);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(SeatHolder.UnexpectedToken.selector, address(nft), 8));
+        nft.safeTransferFrom(owner, holder, 8);
     }
 
-    function test_onERC721Received_rejectsDirectCall() public {
-        vm.expectRevert(abi.encodeWithSelector(SeatLease.UnexpectedToken.selector, address(this), TOKEN_ID));
-        lease.onERC721Received(address(this), owner, TOKEN_ID, "");
+    function test_onERC721Received_holderRejectsOtherCollections() public {
+        _depositOpen(5000);
+        MockSeatNFT other = new MockSeatNFT();
+        other.mint(owner, 1);
+        address holder = _holder();
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(SeatHolder.UnexpectedToken.selector, address(other), 1));
+        other.safeTransferFrom(owner, holder, 1);
+    }
+
+    function test_onERC721Received_holderRejectsDirectCall() public {
+        _depositOpen(5000);
+        SeatHolder holder = SeatHolder(payable(_holder()));
+        vm.expectRevert(abi.encodeWithSelector(SeatHolder.UnexpectedToken.selector, address(this), TOKEN_ID));
+        holder.onERC721Received(address(this), owner, TOKEN_ID, "");
+        assertFalse(lease.depositInFlight(TOKEN_ID));
+    }
+
+    function test_holder_releaseEthRevertsWhenRegistryCannotReceive() public {
+        HolderDriver driver = new HolderDriver(nft, TOKEN_ID);
+        SeatHolder holder = driver.holder();
+        assertEq(address(holder.registry()), address(driver));
+        vm.deal(address(holder), 1 ether);
+        vm.expectRevert(abi.encodeWithSelector(SeatHolder.EthTransferFailed.selector, address(driver), 1 ether));
+        driver.release(address(0), 1 ether);
+        assertEq(address(holder).balance, 1 ether);
+    }
+
+    function test_holder_onlyRegistryMayDrive() public {
+        _depositOpen(5000);
+        SeatHolder holder = SeatHolder(payable(_holder()));
+        vm.deal(address(holder), 1 ether);
+        vm.startPrank(owner);
+        vm.expectRevert(abi.encodeWithSelector(SeatHolder.NotRegistry.selector, owner));
+        holder.execute(address(nft), abi.encodeCall(nft.transferFrom, (address(holder), owner, TOKEN_ID)));
+        vm.expectRevert(abi.encodeWithSelector(SeatHolder.NotRegistry.selector, owner));
+        holder.releaseNft(owner);
+        vm.expectRevert(abi.encodeWithSelector(SeatHolder.NotRegistry.selector, owner));
+        holder.release(address(0), 1 ether);
+        vm.expectRevert(abi.encodeWithSelector(SeatHolder.NotRegistry.selector, owner));
+        holder.release(address(bond), 1);
+        vm.stopPrank();
+        assertEq(nft.ownerOf(TOKEN_ID), address(holder));
+        assertEq(address(holder).balance, 1 ether);
     }
 
     function test_deposit_rejectsHookForDifferentTokenId() public {
         (EvilNFT evil, SeatLease evilLease) = _evilSetup();
         evil.setBehaviour(EvilNFT.Behaviour.WrongTokenIdHook);
         vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(SeatLease.UnexpectedToken.selector, address(evil), TOKEN_ID + 1));
+        vm.expectRevert(abi.encodeWithSelector(SeatHolder.UnexpectedToken.selector, address(evil), TOKEN_ID + 1));
         evilLease.deposit(TOKEN_ID, 5000, SeatLease.Mode.Open, address(0), BOND_AMOUNT, oracle, QUESTION, "");
     }
 
@@ -148,7 +261,7 @@ contract SeatLeaseLifecycleTest is Base {
         evil.setBehaviour(EvilNFT.Behaviour.HookFromStranger);
         address hookCaller = address(evil.stranger());
         vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(SeatLease.UnexpectedToken.selector, hookCaller, TOKEN_ID));
+        vm.expectRevert(abi.encodeWithSelector(SeatHolder.UnexpectedToken.selector, hookCaller, TOKEN_ID));
         evilLease.deposit(TOKEN_ID, 5000, SeatLease.Mode.Open, address(0), BOND_AMOUNT, oracle, QUESTION, "");
     }
 
@@ -161,10 +274,11 @@ contract SeatLeaseLifecycleTest is Base {
     }
 
     function test_deposit_worksWithMinimalNft() public {
-        (, SeatLease evilLease) = _evilSetup();
+        (EvilNFT evil, SeatLease evilLease) = _evilSetup();
         vm.prank(owner);
         evilLease.deposit(TOKEN_ID, 5000, SeatLease.Mode.Open, address(0), BOND_AMOUNT, oracle, QUESTION, "");
         assertEq(evilLease.seat(TOKEN_ID).owner, owner);
+        assertEq(evil.ownerOf(TOKEN_ID), evilLease.holderOf(TOKEN_ID));
     }
 
     function _evilSetup() internal returns (EvilNFT evil, SeatLease evilLease) {
@@ -177,9 +291,12 @@ contract SeatLeaseLifecycleTest is Base {
 
     function test_setTerms_updatesVacantSeat() public {
         _depositOpen(5000);
+        uint64 activeAt = uint64(block.timestamp + 1 hours);
         vm.prank(owner);
         vm.expectEmit(address(lease));
-        emit SeatLease.TermsSet(TOKEN_ID, 1234, SeatLease.Mode.Permissioned, operator, 1, address(0), bytes32(0), "x");
+        emit SeatLease.TermsSet(
+            TOKEN_ID, 1234, SeatLease.Mode.Permissioned, operator, 1, address(0), bytes32(0), "x", activeAt
+        );
         lease.setTerms(TOKEN_ID, 1234, SeatLease.Mode.Permissioned, operator, 1, address(0), bytes32(0), "x");
         SeatLease.Seat memory s = lease.seat(TOKEN_ID);
         assertEq(s.ownerBps, 1234);
@@ -189,6 +306,108 @@ contract SeatLeaseLifecycleTest is Base {
         assertEq(s.oracleSigner, address(0));
         assertEq(s.questionHash, bytes32(0));
         assertEq(s.listing, "x");
+        assertEq(s.termsActiveAt, activeAt);
+    }
+
+    // ---------------------------------------------------------- terms delay (finding 3b42aa8a)
+
+    /// @dev Regression for finding 3b42aa8a: a `take` that lands after the owner changed the terms is refused
+    ///      instead of seating the operator under terms it never inspected.
+    function test_take_refusedUntilChangedTermsAreActive() public {
+        _depositOpen(5000);
+        vm.prank(owner);
+        lease.setTerms(TOKEN_ID, 5000, SeatLease.Mode.Open, address(0), BOND_AMOUNT, stranger, QUESTION, "");
+        uint64 activeAt = lease.seat(TOKEN_ID).termsActiveAt;
+        assertEq(activeAt, uint64(vm.getBlockTimestamp() + 1 hours));
+
+        vm.startPrank(operator);
+        bond.approve(address(lease), BOND_AMOUNT);
+        vm.expectRevert(abi.encodeWithSelector(SeatLease.TermsNotActive.selector, TOKEN_ID, activeAt));
+        lease.take(TOKEN_ID);
+        vm.warp(activeAt - 1);
+        vm.expectRevert(abi.encodeWithSelector(SeatLease.TermsNotActive.selector, TOKEN_ID, activeAt));
+        lease.take(TOKEN_ID);
+        vm.warp(activeAt);
+        lease.take(TOKEN_ID);
+        vm.stopPrank();
+        assertEq(lease.seat(TOKEN_ID).operator, operator);
+        assertEq(lease.seat(TOKEN_ID).takenAt, uint64(block.timestamp));
+        assertEq(lease.seat(TOKEN_ID).takenBlock, uint64(block.number));
+    }
+
+    /// @dev The exact scenario of finding 3b42aa8a: the owner front-runs the victim's `take` by swapping the oracle
+    ///      signer for its own key. The victim is not seated and keeps its bond; there is nothing to forfeit.
+    function test_take_frontRunWithSwappedOracleSignerDoesNotSeatTheVictim() public {
+        (address ownerSigner, uint256 ownerSignerKey) = makeAddrAndKey("owner-signer");
+        _depositOpen(5000);
+        vm.prank(operator);
+        bond.approve(address(lease), BOND_AMOUNT);
+        // Front-run.
+        vm.prank(owner);
+        lease.setTerms(TOKEN_ID, 5000, SeatLease.Mode.Open, address(0), BOND_AMOUNT, ownerSigner, QUESTION, "");
+        vm.prank(operator);
+        vm.expectRevert(
+            abi.encodeWithSelector(SeatLease.TermsNotActive.selector, TOKEN_ID, uint64(block.timestamp + 1 hours))
+        );
+        lease.take(TOKEN_ID);
+        assertEq(lease.seat(TOKEN_ID).operator, address(0));
+        assertEq(bond.balanceOf(operator), 10 * BOND_AMOUNT);
+
+        SeatLease.OracleAttestation memory att = _goodAttestation(keccak256("req"));
+        vm.expectRevert(abi.encodeWithSelector(SeatLease.SeatVacant.selector, TOKEN_ID));
+        lease.cutByOracle(TOKEN_ID, att, _signAttestation(ownerSignerKey, att));
+        assertEq(bond.balanceOf(owner), 0);
+    }
+
+    /// @dev Withdrawing and redepositing with new terms is delayed the same way, so it cannot be used to swap terms
+    ///      under a pending `take` either.
+    function test_take_refusedAfterWithdrawAndRedepositUntilDelayPasses() public {
+        _depositOpen(5000);
+        vm.startPrank(owner);
+        lease.withdraw(TOKEN_ID);
+        uint64 activeAt = uint64(block.timestamp + 1 hours);
+        assertEq(lease.seat(TOKEN_ID).termsActiveAt, activeAt);
+        nft.approve(address(lease), TOKEN_ID);
+        lease.deposit(TOKEN_ID, 5000, SeatLease.Mode.Open, address(0), BOND_AMOUNT, stranger, QUESTION, "");
+        vm.stopPrank();
+        assertEq(lease.seat(TOKEN_ID).termsActiveAt, activeAt);
+
+        vm.startPrank(operator);
+        bond.approve(address(lease), BOND_AMOUNT);
+        vm.expectRevert(abi.encodeWithSelector(SeatLease.TermsNotActive.selector, TOKEN_ID, activeAt));
+        lease.take(TOKEN_ID);
+        vm.warp(activeAt);
+        lease.take(TOKEN_ID);
+        vm.stopPrank();
+        assertEq(lease.seat(TOKEN_ID).operator, operator);
+    }
+
+    function test_deposit_longAfterWithdrawIsActiveAtOnce() public {
+        _depositOpen(5000);
+        vm.prank(owner);
+        lease.withdraw(TOKEN_ID);
+        vm.warp(vm.getBlockTimestamp() + 2 hours);
+        vm.startPrank(owner);
+        nft.approve(address(lease), TOKEN_ID);
+        lease.deposit(TOKEN_ID, 5000, SeatLease.Mode.Open, address(0), BOND_AMOUNT, oracle, QUESTION, "");
+        vm.stopPrank();
+        assertEq(lease.seat(TOKEN_ID).termsActiveAt, uint64(block.timestamp));
+        _takeOpen();
+        assertEq(lease.seat(TOKEN_ID).operator, operator);
+    }
+
+    function test_take_permissionedIsDelayedToo() public {
+        _depositPermissioned(5000);
+        vm.prank(owner);
+        lease.setTerms(TOKEN_ID, 1, SeatLease.Mode.Permissioned, operator, 0, oracle, QUESTION, "");
+        vm.prank(operator);
+        vm.expectRevert(
+            abi.encodeWithSelector(SeatLease.TermsNotActive.selector, TOKEN_ID, uint64(block.timestamp + 1 hours))
+        );
+        lease.take(TOKEN_ID);
+        _activateTerms();
+        _takePermissioned();
+        assertEq(lease.seat(TOKEN_ID).operator, operator);
     }
 
     function test_setTerms_revertsForNonOwner() public {
@@ -354,6 +573,8 @@ contract SeatLeaseLifecycleTest is Base {
         SeatLease.Seat memory s = lease.seat(TOKEN_ID);
         assertEq(s.operator, address(0));
         assertEq(s.bondHeld, 0);
+        assertEq(s.takenAt, 0);
+        assertEq(s.takenBlock, 0);
         assertEq(s.owner, owner);
         assertEq(bond.balanceOf(operator), before + BOND_AMOUNT);
         assertEq(bond.balanceOf(address(lease)), 0);
@@ -528,6 +749,30 @@ contract SeatLeaseLifecycleTest is Base {
         assertEq(s.ownerBps, 0);
         assertEq(s.oracleSigner, address(0));
         assertEq(bytes(s.listing).length, 0);
+        assertEq(s.termsActiveAt, uint64(block.timestamp + 1 hours));
+    }
+
+    /// @dev Regression for finding ef91abbe: a contract owner without `onERC721Received` can withdraw its seat,
+    ///      because the holder returns it with a plain `transferFrom`.
+    function test_withdraw_worksForContractOwnerWithoutReceiverHook() public {
+        PlainWallet wallet = new PlainWallet();
+        nft.mint(address(wallet), 8);
+        wallet.exec(address(nft), abi.encodeCall(nft.approve, (address(lease), 8)));
+        wallet.exec(
+            address(lease),
+            abi.encodeCall(
+                lease.deposit, (8, 5000, SeatLease.Mode.Open, address(0), 0, address(0), bytes32(0), "plain")
+            )
+        );
+        assertEq(nft.ownerOf(8), lease.holderOf(8));
+        // The wallet could never receive a safe transfer.
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(IERC721Errors.ERC721InvalidReceiver.selector, address(wallet)));
+        nft.safeTransferFrom(owner, address(wallet), TOKEN_ID);
+
+        wallet.exec(address(lease), abi.encodeCall(lease.withdraw, (8)));
+        assertEq(nft.ownerOf(8), address(wallet));
+        assertEq(lease.seat(8).owner, address(0));
     }
 
     function test_withdraw_afterQuitAndCut() public {
@@ -546,7 +791,7 @@ contract SeatLeaseLifecycleTest is Base {
         vm.prank(owner);
         vm.expectRevert(abi.encodeWithSelector(SeatLease.SeatNotVacant.selector, TOKEN_ID));
         lease.withdraw(TOKEN_ID);
-        assertEq(nft.ownerOf(TOKEN_ID), address(lease));
+        assertEq(nft.ownerOf(TOKEN_ID), _holder());
     }
 
     function test_withdraw_revertsForNonOwner() public {
@@ -574,6 +819,7 @@ contract SeatLeaseLifecycleTest is Base {
         vm.stopPrank();
         assertEq(lease.seat(TOKEN_ID).owner, stranger);
         assertEq(lease.seat(TOKEN_ID).ownerBps, 1);
+        assertEq(nft.ownerOf(TOKEN_ID), _holder());
     }
 
     // ------------------------------------------------------------------ fuzz

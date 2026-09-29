@@ -81,11 +81,37 @@ contract Handler is Test {
         depositCalls++;
     }
 
+    /// @dev Lets the terms-activation delay that follows `setTerms` and `withdraw` elapse.
+    function passTime(uint256 secs) external {
+        vm.warp(vm.getBlockTimestamp() + bound(secs, 0, 2 hours));
+        vm.roll(vm.getBlockNumber() + 1);
+    }
+
+    function setTerms(uint256 tokenSeed, uint16 bps, bool open, uint256 bondAmount) external {
+        uint256 t = _token(tokenSeed);
+        SeatLease.Seat memory s = lease.seat(t);
+        if (s.owner == address(0) || s.operator != address(0)) return;
+        bps = uint16(bound(bps, 0, 10_000));
+        bondAmount = bound(bondAmount, 0, 1_000e18);
+        vm.prank(s.owner);
+        lease.setTerms(
+            t,
+            bps,
+            open ? SeatLease.Mode.Open : SeatLease.Mode.Permissioned,
+            s.allowedOperator,
+            bondAmount,
+            address(0),
+            bytes32(0),
+            "inv"
+        );
+    }
+
     function take(uint256 actorSeed, uint256 tokenSeed) external {
         address a = _actor(actorSeed);
         uint256 t = _token(tokenSeed);
         SeatLease.Seat memory s = lease.seat(t);
         if (s.owner == address(0) || s.operator != address(0)) return;
+        if (block.timestamp < s.termsActiveAt) return;
         if (s.mode == SeatLease.Mode.Permissioned && s.allowedOperator != a) return;
         vm.startPrank(a);
         bond.approve(address(lease), s.bondAmount);
@@ -151,7 +177,7 @@ contract Handler is Test {
         ethAmount = bound(ethAmount, 0, 1 ether);
         reward.mint(address(distributor), amount);
         vm.deal(address(distributor), address(distributor).balance + ethAmount);
-        distributor.setReward(address(lease), amount, ethAmount);
+        distributor.setReward(lease.holderOf(t), amount, ethAmount);
         // The reward token is listed twice and ETH once: a repeated entry must be booked only once.
         address[] memory tokens = new address[](3);
         tokens[0] = address(reward);
@@ -163,16 +189,52 @@ contract Handler is Test {
         ghostEthCredited += ethAmount;
     }
 
+    /// @dev Pays the seat's wallet directly, as a third-party claim or a plain transfer would, then skims it.
+    function skim(uint256 tokenSeed, uint256 amount, bool eth) external {
+        uint256 t = _token(tokenSeed);
+        if (lease.seat(t).owner == address(0)) return;
+        address holder = lease.holderOf(t);
+        if (eth) {
+            amount = bound(amount, 1, 10 ether);
+            vm.deal(holder, holder.balance + amount);
+            lease.skim(t, address(0));
+            ghostEthCredited += amount;
+        } else {
+            amount = bound(amount, 1, 1_000e18);
+            reward.mint(holder, amount);
+            lease.skim(t, address(reward));
+            ghostCredited += amount;
+        }
+    }
+
     function sweep(uint256 tokenSeed, bool eth) external {
         uint256 t = _token(tokenSeed);
         address token = eth ? address(0) : address(reward);
-        if (lease.seat(t).owner == address(0)) return;
-        uint256 amount = lease.credited(t, token);
+        SeatLease.Seat memory s = lease.seat(t);
+        if (s.owner == address(0)) return;
+        uint256 amount = lease.share(t, token, s.owner);
+        if (s.operator != address(0) && s.operator != s.owner) amount += lease.share(t, token, s.operator);
         if (amount == 0) return;
         lease.sweep(t, token);
         if (eth) ghostEthSwept += amount;
         else ghostSwept += amount;
         sweepCalls++;
+    }
+
+    function sweepFor(uint256 actorSeed, uint256 tokenSeed, bool eth) external {
+        address a = _actor(actorSeed);
+        uint256 t = _token(tokenSeed);
+        address token = eth ? address(0) : address(reward);
+        uint256 amount = lease.share(t, token, a);
+        if (amount == 0) return;
+        lease.sweepFor(t, token, a);
+        if (eth) ghostEthSwept += amount;
+        else ghostSwept += amount;
+        sweepCalls++;
+    }
+
+    function actorCount() external view returns (uint256) {
+        return actors.length;
     }
 
     function tokenCount() external view returns (uint256) {
@@ -198,12 +260,30 @@ contract SeatLeaseInvariantTest is StdInvariant, Test {
         targetContract(address(handler));
     }
 
-    /// @dev The registry holds a token exactly when its seat is deposited; nothing else ever moves it.
+    /// @dev A seat's holder owns the token exactly when the seat is deposited; nothing else ever moves it, and the
+    ///      registry itself never holds a seat.
     function invariant_nftHeldIffDeposited() public view {
         for (uint256 i; i < handler.tokenCount(); ++i) {
             uint256 t = handler.tokenIds(i);
             bool deposited = lease.seat(t).owner != address(0);
-            assertEq(nft.ownerOf(t) == address(lease), deposited, "custody mismatch");
+            address holder = lease.holderOf(t);
+            assertEq(holder != address(0) && nft.ownerOf(t) == holder, deposited, "custody mismatch");
+            assertTrue(nft.ownerOf(t) != address(lease), "registry holds a seat");
+        }
+    }
+
+    /// @dev Every booked unit is owed to exactly one account: per seat and token, the shares sum to `credited`.
+    function invariant_sharesSumToCredited() public view {
+        address[2] memory tokens = [address(reward), address(0)];
+        for (uint256 i; i < handler.tokenCount(); ++i) {
+            uint256 t = handler.tokenIds(i);
+            for (uint256 k; k < tokens.length; ++k) {
+                uint256 sum;
+                for (uint256 j; j < handler.actorCount(); ++j) {
+                    sum += lease.share(t, tokens[k], handler.actors(j));
+                }
+                assertEq(sum, lease.credited(t, tokens[k]), "shares != credited");
+            }
         }
     }
 

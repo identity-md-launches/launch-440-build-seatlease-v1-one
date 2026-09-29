@@ -2,8 +2,10 @@
 pragma solidity ^0.8.26;
 
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import {IERC721Receiver} from "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 import {SeatLease} from "../../src/SeatLease.sol";
+import {SeatHolder} from "../../src/SeatHolder.sol";
 
 /// @dev ERC-20 that charges a fee on every transfer so received amounts differ from requested amounts.
 contract FeeOnTransferToken is ERC20 {
@@ -118,7 +120,7 @@ contract EthRejecter {
     }
 }
 
-/// @dev Sweep recipient that reenters `sweep` when paid in ETH.
+/// @dev Sweep recipient that reenters `sweep` when paid in ETH and records whether the inner call succeeded.
 contract ReentrantSweeper {
     SeatLease public lease;
     uint256 public tokenId;
@@ -134,21 +136,25 @@ contract ReentrantSweeper {
         if (!reentered) {
             reentered = true;
             (innerOk,) = address(lease).call(abi.encodeCall(SeatLease.sweep, (tokenId, address(0))));
-            require(innerOk, "reenter failed");
         }
     }
 }
 
-/// @dev Distributor that reenters SeatLease with arbitrary calldata when claimed from.
+/// @dev Distributor that reenters the registry with arbitrary calldata when claimed from (by a seat's holder).
 contract ReentrantDistributor {
+    address public immutable registry;
     bytes public payload;
+
+    constructor(address registry_) {
+        registry = registry_;
+    }
 
     function setPayload(bytes calldata p) external {
         payload = p;
     }
 
     function claim() external {
-        (bool ok, bytes memory ret) = msg.sender.call(payload);
+        (bool ok, bytes memory ret) = registry.call(payload);
         if (!ok) {
             assembly {
                 revert(add(ret, 32), mload(ret))
@@ -178,6 +184,72 @@ contract BalanceOfAnswerer {
     }
 
     function claim() external {}
+}
+
+/// @dev Distributor keyed by account and callable by anyone, like a Merkle distributor: pays `account`, not the caller.
+contract ClaimForDistributor {
+    ERC20 public immutable token;
+
+    constructor(ERC20 token_) {
+        token = token_;
+    }
+
+    receive() external payable {}
+
+    function claimFor(address account, uint256 tokenAmount, uint256 ethAmount) external {
+        if (tokenAmount != 0) token.transfer(account, tokenAmount);
+        if (ethAmount != 0) {
+            (bool ok,) = account.call{value: ethAmount}("");
+            require(ok, "eth payout failed");
+        }
+    }
+}
+
+/// @dev Distributor with a recipient parameter: whoever calls picks where the reward goes.
+contract ClaimToDistributor {
+    ERC20 public immutable token;
+
+    constructor(ERC20 token_) {
+        token = token_;
+    }
+
+    function claimTo(address to, uint256 amount) external {
+        token.transfer(to, amount);
+    }
+}
+
+/// @dev Contract wallet with no `onERC721Received`: it can hold a seat it was minted or plainly transferred, but a
+///      `safeTransferFrom` to it reverts.
+contract PlainWallet {
+    function exec(address target, bytes calldata data) external returns (bytes memory) {
+        (bool ok, bytes memory ret) = target.call(data);
+        if (!ok) {
+            assembly {
+                revert(add(ret, 32), mload(ret))
+            }
+        }
+        return ret;
+    }
+}
+
+/// @dev Stands in for the registry to drive a holder directly. It cannot receive ETH.
+contract HolderDriver {
+    SeatHolder public immutable holder;
+
+    constructor(IERC721 nft, uint256 tokenId) {
+        holder = new SeatHolder(nft, tokenId);
+    }
+
+    function release(address token, uint256 amount) external {
+        holder.release(token, amount);
+    }
+}
+
+/// @dev ETH recipient that burns every unit of gas it is given.
+contract GasBurner {
+    receive() external payable {
+        while (true) {}
+    }
 }
 
 /// @dev Distributor that just pays ETH.
