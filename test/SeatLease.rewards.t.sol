@@ -1015,16 +1015,32 @@ contract SeatLeaseRewardsTest is Base {
 
     function testFuzz_anyoneCanCreditAndSweep(address caller, uint256 amount) public {
         vm.assume(caller != address(0) && caller != address(lease) && caller.code.length == 0);
+        // The caller may coincide with the owner or operator; measure from its starting balance rather than
+        // assuming it starts empty.
         amount = bound(amount, 1, 10 * AMOUNT);
         _depositOpen(2500);
         _takeOpen();
         reward.mint(caller, amount);
+        uint256 callerBefore = reward.balanceOf(caller);
+        uint256 ownerBefore = reward.balanceOf(owner);
+        uint256 operatorBefore = reward.balanceOf(operator);
         vm.startPrank(caller);
         reward.approve(address(lease), amount);
         lease.credit(TOKEN_ID, address(reward), amount);
         lease.sweep(TOKEN_ID, address(reward));
         vm.stopPrank();
-        assertEq(reward.balanceOf(caller), 0);
-        assertEq(reward.balanceOf(owner) + reward.balanceOf(operator), 10 * AMOUNT + amount);
+        uint256 ownerShare = (amount * 2500) / 10_000;
+        if (caller == owner) {
+            assertEq(reward.balanceOf(owner), ownerBefore - amount + ownerShare);
+            assertEq(reward.balanceOf(operator), operatorBefore + amount - ownerShare);
+        } else if (caller == operator) {
+            assertEq(reward.balanceOf(operator), operatorBefore - amount + amount - ownerShare);
+            assertEq(reward.balanceOf(owner), ownerBefore + ownerShare);
+        } else {
+            assertEq(reward.balanceOf(caller), callerBefore - amount);
+            assertEq(reward.balanceOf(owner), ownerBefore + ownerShare);
+            assertEq(reward.balanceOf(operator), operatorBefore + amount - ownerShare);
+        }
+        assertEq(reward.balanceOf(address(lease)), 0);
     }
 }
