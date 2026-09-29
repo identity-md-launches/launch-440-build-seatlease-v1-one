@@ -77,6 +77,9 @@ contract Handler is Test {
             bytes32(0),
             "inv"
         );
+        address[] memory rewards = new address[](1);
+        rewards[0] = address(reward);
+        lease.setRewardTokens(t, rewards);
         vm.stopPrank();
         depositCalls++;
     }
@@ -116,6 +119,7 @@ contract Handler is Test {
         vm.startPrank(a);
         bond.approve(address(lease), s.bondAmount);
         uint256 before = bond.balanceOf(address(lease));
+        _recordHolderRewards(t, true, true);
         lease.take(t);
         ghostBondIn += bond.balanceOf(address(lease)) - before;
         vm.stopPrank();
@@ -126,6 +130,7 @@ contract Handler is Test {
         SeatLease.Seat memory s = lease.seat(t);
         if (s.operator == address(0)) return;
         uint256 before = bond.balanceOf(address(lease));
+        _recordHolderRewards(t, true, true);
         vm.prank(s.operator);
         lease.quit(t);
         ghostBondOut += before - bond.balanceOf(address(lease));
@@ -136,6 +141,7 @@ contract Handler is Test {
         SeatLease.Seat memory s = lease.seat(t);
         if (s.operator == address(0)) return;
         uint256 before = bond.balanceOf(address(lease));
+        _recordHolderRewards(t, true, true);
         vm.prank(s.owner);
         lease.cut(t);
         ghostBondOut += before - bond.balanceOf(address(lease));
@@ -146,6 +152,7 @@ contract Handler is Test {
         uint256 t = _token(tokenSeed);
         SeatLease.Seat memory s = lease.seat(t);
         if (s.owner == address(0) || s.operator != address(0)) return;
+        _recordHolderRewards(t, true, true);
         vm.prank(s.owner);
         lease.withdraw(t);
         withdrawCalls++;
@@ -173,6 +180,7 @@ contract Handler is Test {
         uint256 t = _token(tokenSeed);
         SeatLease.Seat memory s = lease.seat(t);
         if (s.owner == address(0)) return;
+        _recordHolderRewards(t, true, true);
         amount = bound(amount, 0, 1_000e18);
         ethAmount = bound(ethAmount, 0, 1 ether);
         reward.mint(address(distributor), amount);
@@ -194,6 +202,7 @@ contract Handler is Test {
         uint256 t = _token(tokenSeed);
         if (lease.seat(t).owner == address(0)) return;
         address holder = lease.holderOf(t);
+        _recordHolderRewards(t, eth, !eth);
         if (eth) {
             amount = bound(amount, 1, 10 ether);
             vm.deal(holder, holder.balance + amount);
@@ -205,6 +214,23 @@ contract Handler is Test {
             lease.skim(t, address(reward));
             ghostCredited += amount;
         }
+    }
+
+    /// @dev Leave rewards unbooked across arbitrary later lifecycle actions; settlement must conserve them.
+    function pushToHolder(uint256 tokenSeed, uint256 amount, bool eth) external {
+        uint256 t = _token(tokenSeed);
+        if (lease.seat(t).owner == address(0)) return;
+        address holder = lease.holderOf(t);
+        amount = bound(amount, 1, 10 ether);
+        if (eth) vm.deal(holder, holder.balance + amount);
+        else reward.mint(holder, amount);
+    }
+
+    /// @dev Each collecting action includes balances left by prior pushToHolder calls in its ghost totals.
+    function _recordHolderRewards(uint256 t, bool eth, bool erc20) private {
+        address holder = lease.holderOf(t);
+        if (eth) ghostEthCredited += holder.balance;
+        if (erc20) ghostCredited += reward.balanceOf(holder);
     }
 
     function sweep(uint256 tokenSeed, bool eth) external {

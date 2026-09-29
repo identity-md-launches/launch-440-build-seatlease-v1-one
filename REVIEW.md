@@ -11,7 +11,78 @@ out (reentrancy, push versus pull, lying tokens, rounding, conservation), arithm
 (front-running, expiries), signatures (replay, malleability, ERC-1271), external dependencies, and what
 the tests do not cover.
 
-## Revision 2 (this round)
+## Revision 3 (this round)
+
+### High 327c1ca4: holder rewards could be assigned by choosing the booking tenure
+
+Reproduced before editing: the supplied `Proof_327c1ca4a774.t.sol` failed with an attacker taking 5 ETH
+from 10 ETH paid while vacant and recovering its entire bond. Independent reproductions also failed for
+10e18 ERC-20 paid while vacant (5e18 extracted) and the owner cutting before skimming 1000e18 (the operator
+received zero instead of 500e18). The original proof is unchanged under `test/scratch/` and now passes.
+
+Fix: owners declare up to 16 ERC-20 rewards with `setRewardTokens`; ETH is always included. The list is
+vacant-only, cannot contain duplicates or the NFT, and changing it starts the same one-hour activation
+delay as other terms. `take`, `quit`, `cut`, and `cutByOracle` collect the holder's ETH and declared tokens
+before changing the operator. `withdraw` also collects them before clearing the owner and list. Collection
+uses measured receipts, preserving fee-on-transfer accounting and separation of rewards from bonds.
+During the first `TERMS_DELAY` after each take, holder collections go entirely to the owner. This also
+blocks atomic extraction through a third-party account-keyed distributor or an undeclared token. Direct
+`credit` retains immediate splitting; booked shares remain final.
+
+Scope of the guarantee: declared holder balances are settled at tenure boundaries. Unlisted ERC-20s and
+unpaid distributor entitlements do not expose historical accrual to the registry; after warm-up their
+collection uses the then-current split. Warm-up is evaluated at collection, not transfer time. The README
+now states this explicitly instead of promising unconditional protection for everything paid to a holder.
+Owners must declare all expected tokens before leasing. The bounded list cannot grow through dust credits.
+Declared tokens are trusted to keep balance queries and transfers usable: a paused or malicious reward
+token can revert settlement and block exit. Skipping failed settlement would reopen reward reassignment,
+so failure is atomic; nontransferable/rebasing/malicious tokens are unsupported. The regression documents
+rollback and recovery after transfer functionality resumes. This dependency should be reviewed when
+choosing a seat, just as the bond token and distributor must be reviewed.
+
+Reentrancy review: every collection caller is guarded. `setTerms` gained the same guard so a declared
+reward token that also owns the seat cannot change terms through a transfer callback during `take`.
+Regression `test_settlementCannotReenterTermsChangeDuringTake` exercises this boundary.
+
+Delivered regressions in `test/SeatLease.revision3.t.sol` cover both modes, ETH/ERC-20 vacant extraction,
+account-keyed claims after take, cut-then-skim/claim, all three exit paths with fuzzed amounts and bps,
+warm-up boundary and reset on retake, direct credit during warm-up, list validation and delayed activation,
+withdraw/redeposit ownership, fee tokens, and collection callback reentrancy. The invariant handler now
+leaves unbooked rewards in holders across later lifecycle actions and includes automatic settlement in its
+conservation totals. Three existing claim/skim tests advance past warm-up before asserting the normal split.
+
+### Low c8742c34: `sweepFor` could never pay a receiver needing more than 100k gas
+
+Reproduced with a receiver writing eight cold storage slots: both `sweep` and `sweepFor` retained its full
+1 ETH share. Fix: `sweep` keeps the per-recipient 100k stipend; `sweepFor` forwards available gas to its
+single recipient (subject to the EVM call gas limit). Shares are debited before the call and restored on
+failure; reentrancy guards remain in force. Regression tests exercise successful collection by a heavy
+former operator and a receiver attempting to reenter with the larger gas budget. An out-of-gas transaction
+rolls back and cannot consume a share.
+
+### Low e2bd8dee: instant quit escapes oracle forfeiture (accepted design, no behavior change)
+
+Reproduced: quit immediately returns the full bond; the attestation then fails `SeatVacant`. After quit and
+retake at block 110, an observation starting at block 100 fails `OracleWindowPredatesTenure`, even for the
+same operator. The brief explicitly requires instant bond return, and tenure binding must protect later
+operators. No unbonding delay was added. README now includes the same-operator retake case, and
+`test_instantQuitAndRetakeRejectsOldAttestation_documented` preserves the specified behavior.
+
+### Low e4dd366b: plain NFT transfer to a holder permanently locks the seat
+
+Reproduced after withdrawal: plain `transferFrom` to the holder succeeds, then deposit fails
+`NotSeatOwner`, withdraw fails `SeatNotDeposited`, and direct release fails `NotRegistry`. A rescue cannot
+authenticate a rightful owner from this state. Added an explicit README warning to use only `deposit` for
+NFT custody; paying holder rewards is a separate operation. No rescue authority or custody behavior was
+added. Regression: `test_plainTransferToHolderLocksSeat_documented`.
+
+Validation: Solidity 0.8.26, warning-denying build, full tests including the supplied proof, formatting,
+gas snapshot, and coverage. SeatLease has 100% function and branch coverage (45/45 and 80/80); 313/314 lines
+and 405/406 statements are covered. The only uninstrumented line is the ETH assembly `call`, executed by
+both bounded and full-gas payout regressions. Deployment of this revision and its two mocks on local Anvil
+is recorded separately in `deployments/anvil-revision3-31337.json`; no public or mainnet deployment occurred.
+
+## Revision 2 (previous round)
 
 ### High: `claim()` booked the registry-wide balance gain to whichever seat the caller named
 
@@ -164,7 +235,7 @@ equals the input byte for byte. `isValidSignature` still returns `0xffffffff` ra
 - **Holder reuse across deposits.** Rewards paid to a holder while its seat is not deposited are booked to
   whoever deposits the token id next; they belong to the NFT, which that depositor holds.
 - **EOA operators only.** Pairing recovers an ECDSA signature.
-- **Runtime size.** `SeatLease` is 22,360 bytes at `optimizer_runs = 200` (2,216 under EIP-170) because the
+- **Runtime size.** `SeatLease` is 23,747 bytes at `optimizer_runs = 200` (829 under EIP-170) because the
   holder's creation code is embedded. Neither contract contains `DELEGATECALL`, `CALLCODE` or `SELFDESTRUCT`;
   a scan mirroring the project floor was run during the review.
 

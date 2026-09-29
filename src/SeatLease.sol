@@ -88,6 +88,8 @@ contract SeatLease is IERC1271, EIP712, ReentrancyGuard {
     uint16 public constant BPS = 10_000;
     /// @notice Maximum byte length of a seat listing.
     uint256 public constant MAX_LISTING_BYTES = 280;
+    /// @notice Maximum number of ERC-20 rewards collected at each operator change. ETH is always collected.
+    uint256 public constant MAX_REWARD_TOKENS = 16;
     /// @notice `answerType` value the oracle uses for boolean answers.
     uint8 public constant ANSWER_TYPE_BOOL = 1;
     /// @notice How long after `setTerms` (or `withdraw`) a seat's terms must stand before anyone can take it.
@@ -132,6 +134,8 @@ contract SeatLease is IERC1271, EIP712, ReentrancyGuard {
     mapping(uint256 tokenId => Seat) private _seats;
     /// @dev The wallet of each seat, created on first deposit and reused for every later deposit of the token id.
     mapping(uint256 tokenId => SeatHolder) private _holders;
+    /// @dev Owner-declared, bounded list; immutable during a tenure so outgoing rewards cannot be skipped.
+    mapping(uint256 tokenId => address[]) private _rewardTokens;
     /// @dev Unswept booked balance of a seat per token; the sum of that seat's `_shares` for the token.
     mapping(uint256 tokenId => mapping(address token => uint256 amount)) private _credited;
     /// @dev What each account is owed out of a seat's booked balance, fixed at booking time.
@@ -166,6 +170,7 @@ contract SeatLease is IERC1271, EIP712, ReentrancyGuard {
         uint64 activeAt
     );
     event SeatTaken(uint256 indexed tokenId, address indexed operator, uint256 bondHeld);
+    event RewardTokensSet(uint256 indexed tokenId, address[] tokens, uint64 activeAt);
     event SeatQuit(uint256 indexed tokenId, address indexed operator, uint256 bondReturned);
     event SeatCut(uint256 indexed tokenId, address indexed operator, uint256 bondReturned);
     event SeatCutByOracle(
@@ -205,6 +210,8 @@ contract SeatLease is IERC1271, EIP712, ReentrancyGuard {
     error TermsNotActive(uint256 tokenId, uint64 activeAt);
     error InvalidBps(uint16 ownerBps);
     error ListingTooLong(uint256 length);
+    error TooManyRewardTokens(uint256 length);
+    error DuplicateRewardToken(address token);
     error NftNotReceived(uint256 tokenId);
     error NftNotHeld(uint256 tokenId);
     error NoOracle(uint256 tokenId);
@@ -311,7 +318,7 @@ contract SeatLease is IERC1271, EIP712, ReentrancyGuard {
         address oracleSigner,
         bytes32 questionHash,
         string calldata listing
-    ) external {
+    ) external nonReentrant {
         Seat storage s = _onlyOwner(tokenId);
         if (s.operator != address(0)) revert SeatNotVacant(tokenId);
         // forge-lint: disable-next-line(unsafe-typecast)
@@ -319,6 +326,27 @@ contract SeatLease is IERC1271, EIP712, ReentrancyGuard {
         _setTerms(
             s, tokenId, ownerBps, mode, allowedOperator, bondAmount, oracleSigner, questionHash, listing, activeAt
         );
+    }
+
+    /// @notice Declare the ERC-20 rewards to settle before every operator change. Owner only, vacant only.
+    /// @dev ETH is implicit. Tokens must be transferable ERC-20s; their balance/transfer calls must remain usable.
+    ///      Changing the list delays `take` just like changing other terms. Undeclared tokens can still be skimmed,
+    ///      but have no settlement guarantee across operator changes. No caller can grow this list with dust.
+    function setRewardTokens(uint256 tokenId, address[] calldata tokens) external nonReentrant {
+        Seat storage s = _onlyOwner(tokenId);
+        if (s.operator != address(0)) revert SeatNotVacant(tokenId);
+        if (tokens.length > MAX_REWARD_TOKENS) revert TooManyRewardTokens(tokens.length);
+        for (uint256 i; i < tokens.length; ++i) {
+            address token = tokens[i];
+            if (token == address(seatNFT) || token.code.length == 0 || !_answersBalanceOf(token)) {
+                revert ForbiddenToken(token);
+            }
+            if (_listedBefore(tokens, i)) revert DuplicateRewardToken(token);
+        }
+        _rewardTokens[tokenId] = tokens;
+        // forge-lint: disable-next-line(unsafe-typecast)
+        s.termsActiveAt = uint64(block.timestamp + TERMS_DELAY);
+        emit RewardTokensSet(tokenId, tokens, s.termsActiveAt);
     }
 
     /// @notice Become the operator of a vacant seat whose terms are active. Open seats pull `bondAmount` of the bond
@@ -338,6 +366,7 @@ contract SeatLease is IERC1271, EIP712, ReentrancyGuard {
             held = bondToken.balanceOf(address(this)) - before;
         }
 
+        _settleHolder(tokenId);
         s.operator = msg.sender;
         s.bondHeld = held;
         // forge-lint: disable-next-line(unsafe-typecast)
@@ -351,6 +380,7 @@ contract SeatLease is IERC1271, EIP712, ReentrancyGuard {
     function quit(uint256 tokenId) external nonReentrant {
         Seat storage s = _seats[tokenId];
         if (msg.sender != s.operator) revert NotOperator(tokenId, msg.sender);
+        _settleHolder(tokenId);
         uint256 held = _clearOperator(s);
         emit SeatQuit(tokenId, msg.sender, held);
         _payBond(msg.sender, held);
@@ -362,6 +392,7 @@ contract SeatLease is IERC1271, EIP712, ReentrancyGuard {
         Seat storage s = _onlyOwner(tokenId);
         address operator = s.operator;
         if (operator == address(0)) revert SeatVacant(tokenId);
+        _settleHolder(tokenId);
         uint256 held = _clearOperator(s);
         emit SeatCut(tokenId, operator, held);
         _payBond(operator, held);
@@ -399,6 +430,7 @@ contract SeatLease is IERC1271, EIP712, ReentrancyGuard {
         if (recovered != signer) revert OracleSignerMismatch(signer, recovered);
 
         _usedRequests[attestation.requestId] = true;
+        _settleHolder(tokenId);
         uint256 held = _clearOperator(s);
         emit SeatCutByOracle(tokenId, operator, attestation.requestId, held);
         _payBond(s.owner, held);
@@ -411,6 +443,8 @@ contract SeatLease is IERC1271, EIP712, ReentrancyGuard {
         Seat storage s = _onlyOwner(tokenId);
         if (s.operator != address(0)) revert SeatNotVacant(tokenId);
         SeatHolder holder = _holders[tokenId];
+        _settleHolder(tokenId);
+        delete _rewardTokens[tokenId];
         delete _seats[tokenId];
         // forge-lint: disable-next-line(unsafe-typecast)
         _seats[tokenId].termsActiveAt = uint64(block.timestamp + TERMS_DELAY);
@@ -440,7 +474,7 @@ contract SeatLease is IERC1271, EIP712, ReentrancyGuard {
             received = IERC20(token).balanceOf(address(this)) - before;
             if (received == 0) revert ZeroAmount();
         }
-        _book(tokenId, token, received);
+        _book(tokenId, token, received, _seats[tokenId].operator);
         emit Credited(tokenId, token, msg.sender, received);
     }
 
@@ -510,16 +544,17 @@ contract SeatLease is IERC1271, EIP712, ReentrancyGuard {
         if (ownerAmount + operatorAmount == 0) revert ZeroAmount();
 
         emit Swept(tokenId, token, owner, ownerAmount, operator, operatorAmount);
-        _payShare(tokenId, token, owner, ownerAmount);
-        _payShare(tokenId, token, operator, operatorAmount);
+        _payShare(tokenId, token, owner, ownerAmount, SWEEP_ETH_GAS);
+        _payShare(tokenId, token, operator, operatorAmount, SWEEP_ETH_GAS);
     }
 
     /// @notice Pay `account` the share of a seat's `token` balance that was booked to it, whether or not it still
     ///         owns or operates the seat and whether or not the seat is still deposited. Anyone may call.
+    /// @dev ETH forwards available gas: a heavy recipient can collect here without blocking another recipient.
     function sweepFor(uint256 tokenId, address token, address account) external nonReentrant {
         uint256 amount = _shares[tokenId][token][account];
         if (amount == 0) revert ZeroAmount();
-        _payShare(tokenId, token, account, amount);
+        _payShare(tokenId, token, account, amount, gasleft());
     }
 
     /// @notice Collect a bond that could not be pushed to you when your seat was cleared.
@@ -587,6 +622,11 @@ contract SeatLease is IERC1271, EIP712, ReentrancyGuard {
     /// @notice The wallet that holds a seat and receives its rewards; zero until the token id is first deposited.
     function holderOf(uint256 tokenId) external view returns (address) {
         return address(_holders[tokenId]);
+    }
+
+    /// @notice ERC-20 rewards settled on operator changes. ETH is always settled separately.
+    function rewardTokens(uint256 tokenId) external view returns (address[] memory) {
+        return _rewardTokens[tokenId];
     }
 
     /// @notice Booked, not yet swept, balance of `token` for a seat: the sum of every account's share.
@@ -713,12 +753,9 @@ contract SeatLease is IERC1271, EIP712, ReentrancyGuard {
         s.takenBlock = 0;
     }
 
-    /// @dev Books `amount` to the seat and splits it between the owner and the operator seated right now by
-    ///      `ownerBps`; a vacant seat books everything to the owner. The split is final: later takes, quits and
-    ///      cuts only affect amounts booked after them.
-    function _book(uint256 tokenId, address token, uint256 amount) private {
+    /// @dev Books a final split. A zero `operator` assigns everything to the owner (vacancy or holder warm-up).
+    function _book(uint256 tokenId, address token, uint256 amount, address operator) private {
         Seat storage s = _seats[tokenId];
-        address operator = s.operator;
         uint256 ownerPart = operator == address(0) ? amount : (amount * s.ownerBps) / BPS;
         uint256 operatorPart = amount - ownerPart;
         _credited[tokenId][token] += amount;
@@ -734,7 +771,19 @@ contract SeatLease is IERC1271, EIP712, ReentrancyGuard {
         }
     }
 
-    /// @dev Moves the holder's whole balance of `token` to the registry and books what arrives.
+    /// @dev Settle under the outgoing tenure, before changing operator or clearing the seat's owner.
+    function _settleHolder(uint256 tokenId) private {
+        SeatHolder holder = _holders[tokenId];
+        _collect(tokenId, holder, address(0));
+        address[] storage tokens = _rewardTokens[tokenId];
+        for (uint256 i; i < tokens.length; ++i) {
+            _collect(tokenId, holder, tokens[i]);
+        }
+    }
+
+    /// @dev Moves the holder's whole balance of `token` to the registry and books what arrives. During the first
+    ///      TERMS_DELAY of a tenure, holder collections belong entirely to the owner. This prevents an atomic
+    ///      take/claim-for-holder/skim/quit from sharing rewards that were already claimable before the take.
     function _collect(uint256 tokenId, SeatHolder holder, address token) private returns (uint256 received) {
         uint256 amount = _balanceOf(address(holder), token);
         if (amount == 0) return 0;
@@ -751,16 +800,20 @@ contract SeatLease is IERC1271, EIP712, ReentrancyGuard {
             holder.release(token, amount);
         }
         received = _balanceOf(address(this), token) - before;
-        if (received != 0) _book(tokenId, token, received);
+        if (received != 0) {
+            Seat storage s = _seats[tokenId];
+            address operator = block.timestamp < uint256(s.takenAt) + TERMS_DELAY ? address(0) : s.operator;
+            _book(tokenId, token, received, operator);
+        }
     }
 
     /// @dev Pays `account` its share; on a failed push the share stays booked so nobody else's payout is blocked.
-    function _payShare(uint256 tokenId, address token, address account, uint256 amount) private {
+    function _payShare(uint256 tokenId, address token, address account, uint256 amount, uint256 ethGas) private {
         if (amount == 0) return;
         _shares[tokenId][token][account] = 0;
         _credited[tokenId][token] -= amount;
         totalCredited[token] -= amount;
-        if (_tryPay(token, account, amount)) {
+        if (_tryPay(token, account, amount, ethGas)) {
             emit SharePaid(tokenId, token, account, amount);
         } else {
             _shares[tokenId][token][account] = amount;
@@ -799,13 +852,12 @@ contract SeatLease is IERC1271, EIP712, ReentrancyGuard {
         }
     }
 
-    /// @dev Pushes ETH with a bounded gas stipend, or an ERC-20 through `_tryTransferToken`. Never reverts.
+    /// @dev Pushes ETH with the caller's gas budget, or an ERC-20 through `_tryTransferToken`.
     ///      The ETH push copies no return data, so a recipient can neither revert the sweep nor bloat it.
-    function _tryPay(address token, address to, uint256 amount) private returns (bool ok) {
+    function _tryPay(address token, address to, uint256 amount, uint256 ethGas) private returns (bool ok) {
         if (token == address(0)) {
-            uint256 stipend = SWEEP_ETH_GAS;
             assembly ("memory-safe") {
-                ok := call(stipend, to, amount, 0, 0, 0, 0)
+                ok := call(ethGas, to, amount, 0, 0, 0, 0)
             }
             return ok;
         }

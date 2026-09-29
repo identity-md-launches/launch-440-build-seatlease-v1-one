@@ -490,6 +490,8 @@ contract SeatLeaseRewardsTest is Base {
     function test_claim_booksTokenIncrease() public {
         _depositOpen(5000);
         _takeOpen();
+        // Holder rewards begin sharing after the tenure warm-up.
+        _activateTerms();
         distributor.setReward(_holder(), AMOUNT, 0);
         address[] memory tokens = new address[](1);
         tokens[0] = address(reward);
@@ -699,6 +701,8 @@ contract SeatLeaseRewardsTest is Base {
     function test_skim_booksPushedRewardsFromThirdPartyClaim() public {
         _depositOpen(5000);
         _takeOpen();
+        // Holder rewards begin sharing after the tenure warm-up.
+        _activateTerms();
         ClaimForDistributor d = new ClaimForDistributor(reward);
         reward.mint(address(d), AMOUNT);
         vm.deal(address(d), 1 ether);
@@ -789,6 +793,8 @@ contract SeatLeaseRewardsTest is Base {
     function test_claim_ownerCanRouteRecipientParameterisedPayoutsAway_documented() public {
         _depositOpen(0);
         _takeOpen();
+        // Holder rewards begin sharing after the tenure warm-up.
+        _activateTerms();
         ClaimToDistributor d = new ClaimToDistributor(reward);
         reward.mint(address(d), AMOUNT);
         address[] memory tokens = new address[](1);

@@ -13,7 +13,7 @@ exists: every seat is administered only by the address that deposited it.
 - `src/LaunchToken.sol`: the fixed-supply launch token the project floor requires. The registry never
   references it.
 - `script/Deploy.s.sol`: environment-driven deployment, usable unchanged on mainnet.
-- `deployments/anvil-31337.json`: the recorded local deployment.
+- `deployments/anvil-revision3-31337.json`: this revision's local deployment; `anvil-31337.json` preserves the prior example deployment.
 - `REVIEW.md`: adversarial review, fixes, accepted lows.
 
 Solidity `^0.8.26`, compiler pinned to 0.8.26 in `foundry.toml`, OpenZeppelin Contracts 5.5.0 vendored under
@@ -30,14 +30,16 @@ distributor ──pays──▶ holder ──claim / skim──▶ SeatLease boo
 anyone ──sweep / sweepFor──▶ owner and operator are paid their shares
 ```
 
-1. The owner deposits a seat with its terms. The NFT moves into the seat's holder.
+1. The owner deposits a seat with its terms. The NFT moves into the seat's holder. Before offering it,
+   the owner declares its ERC-20 rewards with `setRewardTokens` (up to 16; ETH is automatic).
 2. An operator takes the seat: the allowed operator (Permissioned) or anyone posting the bond (Open).
 3. The network pairs the operator's device: the operator signs a `WorkerAuthorization` naming the holder
    as `wallet`; the network calls the holder's `isValidSignature`, which the registry answers for the
    seat's current operator.
 4. Rewards arrive at the holder (distributors paying the seat's wallet) or are pushed to the registry with
-   `credit`. `claim` and `skim` book what the holder received. Every booked amount is split at that moment
-   between the owner and the operator seated then, by `ownerBps`; a vacant seat books everything to the owner.
+   `credit`. Holder ETH and declared tokens settle before every operator change under the outgoing split.
+   Holder collections during the first hour of a tenure go entirely to the owner; afterwards they split by
+   `ownerBps`. `credit` splits immediately, including during that hour. Vacant seats book everything to the owner.
 5. `sweep` pays the owner and the current operator their shares; `sweepFor` pays anyone their share, including
    a cut or quit operator and a former owner. A share whose push fails stays booked.
 6. The operator quits, or the owner cuts, or anyone cuts on the strength of a signed oracle attestation
@@ -63,8 +65,9 @@ The oracle domain is fixed: name `"IdentityMD Oracle"`, version `"1"`, `chainId 
 |---|---|---|
 | `BPS` | 10000 | Denominator of `ownerBps` |
 | `MAX_LISTING_BYTES` | 280 | Maximum listing length |
+| `MAX_REWARD_TOKENS` | 16 | Maximum declared ERC-20 reward tokens per seat; ETH is additional |
 | `ANSWER_TYPE_BOOL` | 1 | Oracle `answerType` for booleans |
-| `TERMS_DELAY` | 1 hour | Delay before changed terms can be taken |
+| `TERMS_DELAY` | 1 hour | Delay before changed terms or reward lists can be taken; also the holder reward warm-up |
 | `SWEEP_ETH_GAS` | 100000 | Gas forwarded when `sweep` pushes ETH |
 | `MAGIC_VALUE` / `FAIL_VALUE` | `0x1626ba7e` / `0xffffffff` | ERC-1271 results |
 | `WORKER_AUTHORIZATION_TYPEHASH`, `ORACLE_ATTESTATION_TYPEHASH` | | EIP-712 type hashes |
@@ -75,7 +78,7 @@ The oracle domain is fixed: name `"IdentityMD Oracle"`, version `"1"`, `chainId 
 |---|---|
 | `owner` | Depositor. Zero means not deposited. |
 | `operator` | Current operator. Zero means vacant. |
-| `ownerBps` | Owner's share of every amount booked while an operator is seated (0 to 10000). |
+| `ownerBps` | Owner's share (0 to 10000). Holder collections during the tenure warm-up go entirely to the owner. |
 | `mode` | `Permissioned` (0): only `allowedOperator` may take. `Open` (1): anyone may take by posting the bond. |
 | `allowedOperator` | The only address that may take a Permissioned seat. |
 | `bondAmount` | Bond pulled by `take` on an Open seat (ignored when Permissioned). |
@@ -92,30 +95,31 @@ The oracle domain is fixed: name `"IdentityMD Oracle"`, version `"1"`, `chainId 
 |---|---|---|
 | `deposit(tokenId, ownerBps, mode, allowedOperator, bondAmount, oracleSigner, questionHash, listing)` | NFT owner | Creates the seat's holder if it does not exist, records the caller as owner and the terms, pulls the NFT into the holder with `safeTransferFrom`. Terms are live at once unless the token id was withdrawn less than `TERMS_DELAY` ago. |
 | `setTerms(same parameters)` | owner, vacant seat | Replaces the terms. They become takeable at `now + TERMS_DELAY`. |
-| `take(tokenId)` | anyone | Vacant seat with active terms. Permissioned: caller must be `allowedOperator`. Open: pulls `bondAmount` of the bond token from the caller. Records `takenAt` and `takenBlock`. |
-| `quit(tokenId)` | operator | Clears the operator and returns the bond. Shares already booked to the operator stay theirs. |
-| `cut(tokenId)` | owner, any time | Clears the operator and returns the bond to them. |
-| `cutByOracle(tokenId, attestation, signature)` | anyone | Clears the operator and forfeits the bond to the owner when the attestation is valid (see Oracle cut model). |
-| `withdraw(tokenId)` | owner, vacant seat | Clears the seat and returns the NFT with `transferFrom`. The token id cannot be taken again until `TERMS_DELAY` has passed. Shares stay collectable with `sweepFor`. |
+| `setRewardTokens(tokenId, tokens[])` | owner, vacant seat | Replaces the bounded ERC-20 reward list. Rejects duplicates, the seat NFT, addresses without code and contracts not answering `balanceOf`. ETH is implicit and cannot be listed. Sets `termsActiveAt = now + TERMS_DELAY`. |
+| `take(tokenId)` | anyone | Vacant seat with active terms. Permissioned: caller must be `allowedOperator`. Open: pulls `bondAmount` of the bond token from the caller. Settles holder ETH and declared tokens while vacant, then records `takenAt` and `takenBlock`. |
+| `quit(tokenId)` | operator | Settles holder ETH and declared tokens, clears the operator and returns the bond. Shares already booked to the operator stay theirs. |
+| `cut(tokenId)` | owner, any time | Settles holder ETH and declared tokens under the outgoing split, clears the operator and returns the bond to them. |
+| `cutByOracle(tokenId, attestation, signature)` | anyone | Settles holder ETH and declared tokens under the outgoing split, clears the operator and forfeits the bond to the owner when the attestation is valid (see Oracle cut model). |
+| `withdraw(tokenId)` | owner, vacant seat | Settles holder ETH and declared tokens to the owner, clears the seat and reward list and returns the NFT with `transferFrom`. The token id cannot be taken again until `TERMS_DELAY` has passed. Shares stay collectable with `sweepFor`. |
 | `credit(tokenId, token, amount)` | anyone, payable | Pulls `amount` of `token` (`address(0)` = ETH as `msg.value`) from the caller into the registry and books it. Zero amounts, value mismatches, tokens that move nothing and the seat NFT are refused. |
 | `claim(tokenId, target, data, tokens[])` | owner | The seat's holder calls `target` with `data` and no value. Afterwards the holder must still own the NFT and its balance of every listed token must not have decreased; the holder's whole balance of each listed token, and all of its ETH, is moved to the registry and booked. `target` may not be the NFT, the bond token, the registry, the holder, an address without code, a token with booked balances, or any contract answering `balanceOf`. |
 | `skim(tokenId, token)` | anyone | Moves the holder's whole balance of `token` (`address(0)` = ETH) to the registry and books it. Reverts when nothing arrives. |
 | `sweep(tokenId, token)` | anyone | Pays the owner's share and the current operator's share of `token`. Reverts `ZeroAmount` when both are zero. A share whose push fails is retained. |
-| `sweepFor(tokenId, token, account)` | anyone | Pays `account` its share, whether or not it still owns or operates the seat and whether or not the seat is deposited. |
+| `sweepFor(tokenId, token, account)` | anyone | Pays `account` its share, whether or not it still owns or operates the seat and whether or not the seat is deposited. ETH forwards available gas, allowing receivers that need more than the `sweep` stipend to collect. |
 | `redeemBond()` | anyone | Collects a bond that could not be pushed when the seat was cleared. |
 | `isValidSignature(hash, signature)` | view | ERC-1271, see below. |
 | `isValidSignatureFor(wallet, hash, signature)` | view | Same, additionally requiring the authorization's `wallet` to equal `wallet`. Holders call it with their own address. |
 | `decodeAuthorization(signature)` | pure | Splits a signature blob; reverts `MalformedAuthorization` unless the blob is the canonical `abi.encode` of its fields. |
 
-Views: `seat`, `holderOf(tokenId)`, `credited(tokenId, token)` (the seat's total unswept balance),
+Views: `seat`, `holderOf(tokenId)`, `rewardTokens(tokenId)` (declared ERC-20s, excluding implicit ETH), `credited(tokenId, token)` (the seat's total unswept balance),
 `share(tokenId, token, account)`, `usedRequest(requestId)`, `depositInFlight(tokenId)`, `totalCredited(token)`,
 `bondOwed(account)`, `workerDomain()`, `workerDomainSeparator()`, `oracleDomainSeparator()`,
 `hashWorkerAuthorization(auth)`, `hashOracleAttestation(attestation)`, `seatNFT()`, `bondToken()`.
 
-`receive()` reverts `DirectEthNotAccepted` except while a holder forwards ETH during `claim` or `skim`, so
+`receive()` reverts `DirectEthNotAccepted` except while collecting a holder's ETH, so
 plain ETH sent to the registry is never unattributed. Pay a seat with `credit` or by sending to its holder.
 
-Reentrancy guards: `deposit`, `take`, `quit`, `cut`, `cutByOracle`, `withdraw`, `credit`, `claim`, `skim`,
+Reentrancy guards: `deposit`, `setTerms`, `setRewardTokens`, `take`, `quit`, `cut`, `cutByOracle`, `withdraw`, `credit`, `claim`, `skim`,
 `sweep`, `sweepFor`, `redeemBond`.
 
 ### Events
@@ -125,6 +129,7 @@ Reentrancy guards: `deposit`, `take`, `quit`, `cut`, `cutByOracle`, `withdraw`, 
 | `HolderCreated(tokenId, holder)` | First deposit of a token id |
 | `SeatDeposited(tokenId, owner)` | `deposit` |
 | `TermsSet(tokenId, ownerBps, mode, allowedOperator, bondAmount, oracleSigner, questionHash, listing, activeAt)` | `deposit`, `setTerms` |
+| `RewardTokensSet(tokenId, tokens, activeAt)` | `setRewardTokens`; `withdraw` implicitly clears the list |
 | `SeatTaken(tokenId, operator, bondHeld)` | `take` |
 | `SeatQuit(tokenId, operator, bondReturned)` | `quit` |
 | `SeatCut(tokenId, operator, bondReturned)` | `cut` |
@@ -133,7 +138,7 @@ Reentrancy guards: `deposit`, `take`, `quit`, `cut`, `cutByOracle`, `withdraw`, 
 | `Credited(tokenId, token, from, amount)` | `credit` |
 | `Claimed(tokenId, target, data)` | `claim`, after the call succeeded |
 | `Skimmed(tokenId, token, amount)` | `skim` |
-| `Booked(tokenId, token, amount)` | Every booking (`credit`, `claim`, `skim`) |
+| `Booked(tokenId, token, amount)` | Every booking, including automatic holder settlement |
 | `ShareAccrued(tokenId, token, account, amount)` | Each non-zero part of a booking |
 | `Swept(tokenId, token, owner, ownerAmount, operator, operatorAmount)` | `sweep` |
 | `SharePaid(tokenId, token, account, amount)` | A share pushed successfully |
@@ -151,11 +156,13 @@ Reentrancy guards: `deposit`, `take`, `quit`, `cut`, `cutByOracle`, `withdraw`, 
 | `NotAllowedOperator(tokenId, caller)` | `take` on a Permissioned seat |
 | `SeatNotDeposited(tokenId)` | anything on an undeposited seat |
 | `SeatAlreadyDeposited(tokenId)` | `deposit` twice |
-| `SeatNotVacant(tokenId)` | `setTerms`, `take`, `withdraw` while occupied |
+| `SeatNotVacant(tokenId)` | `setTerms`, `setRewardTokens`, `take`, `withdraw` while occupied |
 | `SeatVacant(tokenId)` | `cut`, `cutByOracle` while vacant |
 | `TermsNotActive(tokenId, activeAt)` | `take` before the terms are active |
 | `InvalidBps(ownerBps)` | `ownerBps > 10000` |
 | `ListingTooLong(length)` | listing over 280 bytes |
+| `TooManyRewardTokens(length)` | `setRewardTokens` with more than 16 entries |
+| `DuplicateRewardToken(token)` | duplicate entry in `setRewardTokens` |
 | `NftNotReceived(tokenId)` | `deposit` when the NFT did not land in the holder |
 | `NftNotHeld(tokenId)` | `claim` when the holder no longer owns the NFT afterwards |
 | `NoOracle(tokenId)` | `cutByOracle` on a seat without `oracleSigner` |
@@ -171,7 +178,7 @@ Reentrancy guards: `deposit`, `take`, `quit`, `cut`, `cutByOracle`, `withdraw`, 
 | `WrongValue(expected, actual)` | `credit` with wrong `msg.value` |
 | `ZeroAmount()` | `credit`, `skim`, `sweep`, `sweepFor` with nothing to move |
 | `ForbiddenTarget(target)` | `claim` target guard |
-| `ForbiddenToken(token)` | the seat NFT as a `credit`, `skim` or `claim` token |
+| `ForbiddenToken(token)` | the seat NFT as a `credit`, `skim` or `claim` token, or an invalid entry in `setRewardTokens` |
 | `ClaimFailed(reason)` | the distributor call reverted; `reason` is its return data |
 | `HolderBalanceDecreased(token, before, afterwards)` | `claim` made a listed balance shrink |
 | `NothingOwed(account)` | `redeemBond` with nothing escrowed |
@@ -337,13 +344,29 @@ Operational rules:
 - Booking paths: `credit` (any payer pushes into the registry), `claim` (the owner has the holder call a
   distributor and everything that arrived is collected), `skim` (anyone collects what the holder already holds:
   a distributor claimed by a third party, an unlisted token, ETH sent to the holder).
-- Every booking is split at once: `ownerPart = amount * ownerBps / 10000` to the owner and the rest to the
-  operator seated at that moment, or everything to the owner while vacant. Rounding dust goes to the operator.
+- Every booking creates final shares: `ownerPart = amount * ownerBps / 10000`, with the remainder to the
+  operator, or everything to the owner while vacant. Rounding dust goes to the operator.
+- `take`, `quit`, `cut` and `cutByOracle` first collect the holder's ETH and all owner-declared reward tokens
+  under the outgoing split. `withdraw` collects them before clearing the owner. This protects funds already
+  in the holder against both a new taker and an owner cutting before a skim. The reward list cannot change
+  during a tenure; replacing it while vacant delays `take` by one hour, as other terms changes do.
+- Collections by `skim`, `claim` and automatic settlement while `block.timestamp < takenAt + TERMS_DELAY`
+  belong entirely to the owner. At equality, normal sharing starts. Every new take restarts this warm-up.
+  It blocks atomic take/claim-for-holder/skim/sweep/quit extraction, including for undeclared tokens and
+  rewards that were claimable before the take. `credit` remains immediately shared because it transfers
+  new funds directly to the registry and books them in the same call.
+- This is settlement at tenure boundaries plus a warm-up, not historical accrual tracking. ERC-20 transfers
+  and arbitrary distributors provide no arrival/earning timestamp the registry can query. Unlisted tokens
+  are not settled at boundaries; unclaimed distributor entitlements are not holder balances. After warm-up,
+  their later collection uses the current split. Declare all expected tokens and prefer `credit` or timely
+  distributor payments to the holder when allocation to an exact tenure matters.
 - `credited(tokenId, token)` is the seat's unswept total; `share(tokenId, token, account)` is what one account
   is owed. `totalCredited(token)` is what the registry owes across all seats.
-- `sweep` pays the owner and the current operator; `sweepFor` pays anyone their share (former operators, former
-  owners). Pushes never revert: ETH is sent with `SWEEP_ETH_GAS` gas and no return-data copy, ERC-20s through a
-  tolerant transfer; a failed push leaves the share booked (`ShareRetained`).
+- `sweep` pays the owner and the current operator using `SWEEP_ETH_GAS` for each ETH push, so a receiver
+  cannot consume the other recipient's gas. `sweepFor` pays just one account (including former operators
+  and owners) and forwards available gas for ETH. Supply enough transaction gas for a heavy receiver;
+  a failed push retains the share (`ShareRetained`), and an out-of-gas transaction rolls back. Both paths
+  are reentrancy guarded and copy no ETH return data. ERC-20s use a tolerant transfer.
 - Invariants held by the test suite: the NFT sits in its holder exactly while the seat is deposited and the
   registry never holds one; swept never exceeds credited; the registry's balance covers booked rewards plus
   bonds; shares sum to `credited` per seat and token.
@@ -351,19 +374,27 @@ Operational rules:
 ## Trust model and operational responsibilities
 
 - **Owner-chosen terms.** The owner picks `oracleSigner`, `questionHash`, `ownerBps`, mode and bond. An
-  operator must read the terms and `termsActiveAt` before taking, and take within `TERMS_DELAY` of reading
+  operator must read the terms, `rewardTokens` and `termsActiveAt` before taking, and take within `TERMS_DELAY` of reading
   active terms: a `take` that lands within that window is seated under exactly those terms or reverts
   `TermsNotActive`. The owner cannot change terms while the seat is occupied.
-- **Owner can cut any time.** `cut` returns the bond and ends the tenure. Shares already booked stay the
-  operator's; only future bookings go entirely to the owner.
-- **Rewards are protected once they reach the seat's wallet.** `claim` calldata is chosen by the owner. A
+- **Owner can cut any time.** `cut` settles declared holder balances under the outgoing split, returns the
+  bond and ends the tenure. Booked operator shares remain payable to that operator. Holder collections
+  during warm-up belong to the owner regardless of who ends the tenure.
+- **Declare rewards before leasing.** ETH and declared, transferable ERC-20 holder balances are settled at
+  operator changes; unlisted tokens and unpaid distributor entitlements have the limits described above.
+  Declared tokens must keep `balanceOf` and transfers usable. A paused, blocklisting, malicious or excessively
+  expensive token can block settlement and therefore operator changes and withdrawal; such tokens are not
+  supported reward-list entries. While vacant, the owner can replace the list. Verify token behavior before
+  taking. The list is bounded and only the owner can change it, so third-party dust cannot grow exit costs.
+- **Distributor behavior.** `claim` calldata is chosen by the owner. A
   distributor with a recipient parameter (`claimTo(address)`) lets the owner send the payout elsewhere,
   and the owner may never call `claim` at all. Anyone, including the operator, may `skim` what a distributor
   pays the holder directly and may call permissionless distributors with the holder as the account. Operators
-  should prefer seats whose distributors pay the holder unconditionally.
+  should prefer seats whose distributors pay the holder unconditionally and whose reward list is complete.
 - **Quit is instant.** The Open-mode bond deters misbehaviour the oracle attests while the operator is still
   seated. An operator watching the mempool can quit before a `cutByOracle` lands and keeps its bond; the
-  attestation can then never be used against the next operator (tenure binding). Owners needing stronger
+  attestation can then never be used against a later tenure (tenure binding), even if the same operator
+  quits and retakes in the same block after the attestation's observation window began. Owners needing stronger
   guarantees should use Permissioned mode with a counterparty they trust. Changing this needs an unbonding
   window, which the brief's `quit` specification does not allow.
 - **EOA operators only.** Pairing recovers an ECDSA signature from the operator, so a contract cannot operate.
@@ -372,6 +403,11 @@ Operational rules:
 - **The registry is nobody's wallet.** ETH forced into the registry with `SELFDESTRUCT`, or tokens transferred
   straight to the registry address, cannot be attributed to a seat and are unrecoverable. Pay seats with
   `credit` or by paying their holder.
+- **Only `deposit` may move a seat into its holder.** Never use plain ERC-721 `transferFrom` to send the NFT
+  to a holder address, including after withdrawal or through a marketplace. It bypasses the receiver hook,
+  creates no deposit record and permanently locks the NFT (effectively burns it). `deposit`, `withdraw` and
+  direct `releaseNft` cannot recover it; there is no admin rescue and no reliable on-chain previous-owner
+  attribution. Sending rewards to a holder is separate from transferring the seat NFT.
 - **Holder reuse.** A token id keeps its holder across withdraw and redeposit. Rewards paid to the holder while
   the seat is not deposited are booked to whoever deposits the token id next (they belong to the NFT, which
   that depositor holds).
@@ -383,7 +419,15 @@ Operational rules:
 
 ### Local (recorded)
 
-`deployments/anvil-31337.json` records the deployment produced by:
+`deployments/anvil-revision3-31337.json` records this revision deployed on a fresh local Anvil chain
+(chain id 31337, port 8546). The unchanged script deployed MockSeatNFT, MockERC20 and SeatLease in block 1.
+The registry is `0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0`, transaction
+`0x517c4f181553317b5f223c15462d01cc512a90d5560c5cebd57dbaadccff0280`; deployed runtime is 23,747 bytes.
+The JSON includes all addresses, transaction hashes, blocks, gas usage and constructor parameters.
+No public chain or mainnet deployment was performed.
+
+The prior revision's `deployments/anvil-31337.json` is retained below for the worked pairing example.
+It records the deployment produced by:
 
 ```
 anvil --port 8545 --chain-id 31337
